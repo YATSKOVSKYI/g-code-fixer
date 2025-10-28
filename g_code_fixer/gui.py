@@ -191,8 +191,8 @@ class SegmentItem(QGraphicsLineItem):
         self.static_start: Optional[QPointF] = None
         self.static_end: Optional[QPointF] = None
         self._base_color = QColor(color)
-        pen = QPen(self._base_color, 0.4)  # Scene units width for better visibility
-        pen.setCosmetic(False)  # Use scene coordinates, not screen pixels
+        pen = QPen(self._base_color, 2.0)  # Increased width for visibility
+        pen.setCosmetic(True)  # Use screen pixels, not scene coordinates
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         self.setPen(pen)
@@ -253,21 +253,21 @@ class SegmentItem(QGraphicsLineItem):
         if (_sip and _sip.isdeleted(self)) or self.scene() is None:
             return
         color = QColor(self._base_color)
-        width = 0.4  # Scene units width
+        width = 2.0  # Screen pixels width
 
         if self._active_handle:
             color = color.lighter(150)
-            width = 0.6
+            width = 3.0
         elif self.isSelected():
             # CAD-style selection: bright cyan highlight
             color = QColor(0, 255, 255)
-            width = 0.8
+            width = 4.0
         elif self._hovered:
             color = color.lighter(140)
-            width = 0.5
+            width = 2.5
 
         pen = QPen(color, width)
-        pen.setCosmetic(False)  # Use scene coordinates
+        pen.setCosmetic(True)  # Use screen pixels for consistent visibility
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         if self.isSelected():
@@ -1527,27 +1527,25 @@ class GCodeScene(QGraphicsScene):
     def _set_items_for_animation(self, active: bool) -> None:
         if self.animation_visuals_hidden == active:
             return
-        visible = not active
 
-        # Only hide during animation, not in edit mode
-        if active:
-            for item in self.segment_items:
-                item.setVisible(visible)
+        base_opacity = 0.25 if active else 1.0
+        handle_opacity = 0.35 if active else 1.0
+
+        for item in self.segment_items:
+            item.setOpacity(base_opacity)
+            item.setVisible(True)
+
+        for handle in self.handles.values():
+            handle.setOpacity(handle_opacity)
+            handle.setEnabled(not active)
+
+        for anchor in self.anchor_items:
+            anchor.setOpacity(handle_opacity)
+            anchor.setVisible(True)
+
+        if not active:
             for handle in self.handles.values():
-                handle.setVisible(visible)
-            for anchor in self.anchor_items:
-                anchor.setVisible(visible)
-            # Hide dimensions during animation
-            for dim in self.dimension_items:
-                dim.setVisible(visible)
-        else:
-            # Show everything when not animating
-            for item in self.segment_items:
-                item.setVisible(True)
-            for handle in self.handles.values():
-                handle.setVisible(True)
-            for anchor in self.anchor_items:
-                anchor.setVisible(True)
+                handle.setEnabled(True)
 
         self.animation_visuals_hidden = active
 
