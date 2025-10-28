@@ -875,6 +875,7 @@ class MainWindow(QMainWindow):
         self.play_pause_button = QPushButton("Пауза", self)
         self.play_pause_button.setEnabled(False)
         self.play_pause_button.clicked.connect(self._on_play_pause_clicked)
+        self._update_play_pause_button(False)
 
         self.speed_label = QLabel("Скорость: 40 мм/с", self)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal, self)
@@ -1051,6 +1052,67 @@ class MainWindow(QMainWindow):
             self.timeline_slider.setValue(0)
             self.timeline_label.setText("Прогресс: 0%")
 
+    def _update_play_pause_button(self, running: bool) -> None:
+        self.play_pause_button.setText("Пауза" if running else "Продолжить")
+
+    def _on_play_pause_clicked(self) -> None:
+        if not self.scene.animation_active:
+            return
+        if self.scene.animation_running:
+            self.scene.pause_animation()
+        else:
+            if not self.scene.resume_animation():
+                self._update_play_pause_button(False)
+
+
+
+    def _on_animation_progress(self, fraction: float) -> None:
+        percent = max(0.0, min(fraction, 1.0)) * 100.0
+        self.timeline_label.setText(f"Прогресс: {percent:.1f}%")
+        if self._block_timeline_updates:
+            return
+        max_value = max(self.timeline_slider.maximum(), 1)
+        value = int(round(fraction * max_value))
+        self._block_timeline_updates = True
+        self.timeline_slider.setValue(value)
+        self._block_timeline_updates = False
+
+    def _on_animation_playing_changed(self, running: bool) -> None:
+        self._update_play_pause_button(running)
+
+    def _on_timeline_value_changed(self, value: int) -> None:
+        max_value = max(self.timeline_slider.maximum(), 1)
+        fraction = value / max_value
+        self.timeline_label.setText(f"Прогресс: {fraction * 100:.1f}%")
+        if self._block_timeline_updates or not self.animate_button.isChecked():
+            return
+        self._block_timeline_updates = True
+        self.scene.set_animation_fraction(fraction)
+        self._block_timeline_updates = False
+
+    def _on_timeline_pressed(self) -> None:
+        if not self.animate_button.isChecked():
+            return
+        self._timeline_dragging = True
+        self._timeline_was_running = self.scene.animation_running
+        if self.scene.animation_running:
+            self.scene.pause_animation()
+
+    def _on_timeline_released(self) -> None:
+        if not self.animate_button.isChecked():
+            self._timeline_dragging = False
+            self._timeline_was_running = False
+            return
+        self._timeline_dragging = False
+        max_value = max(self.timeline_slider.maximum(), 1)
+        fraction = self.timeline_slider.value() / max_value
+        self._block_timeline_updates = True
+        self.scene.set_animation_fraction(fraction)
+        self._block_timeline_updates = False
+        if self._timeline_was_running:
+            self.scene.resume_animation()
+        self._timeline_was_running = False
+
     def _toggle_animation(self, checked: bool) -> None:
         if self._block_animation_toggle:
             return
@@ -1086,8 +1148,14 @@ class MainWindow(QMainWindow):
             self._block_animation_toggle = True
             self.animate_button.setChecked(running)
             self._block_animation_toggle = False
-        if not running and self.statusBar():
-            self.statusBar().showMessage("Анимация остановлена.", 2000)
+        if running:
+            self._set_timeline_controls_enabled(True)
+            self._update_play_pause_button(self.scene.animation_running)
+        else:
+            self._set_timeline_controls_enabled(False)
+            self._update_play_pause_button(False)
+            if self.statusBar():
+                self.statusBar().showMessage("Анимация остановлена.", 2000)
 
 
 def main() -> None:
