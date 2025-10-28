@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import math
 import os
@@ -43,6 +43,7 @@ class StaticAnchorItem(QGraphicsEllipseItem):
         super().__init__(-radius, -radius, radius * 2.0, radius * 2.0)
         self.setPos(position)
         self.setPen(QPen(QColor(180, 180, 180), 0))
+        self._pending_creation_start_index: Optional[int] = None
         self.setBrush(QColor(200, 200, 200, 120))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
         self.setZValue(5)
@@ -99,6 +100,8 @@ class SegmentItem(QGraphicsLineItem):
             self.setLine(start.x(), start.y(), end.x(), end.y())
         self._update_pen()
 
+        if getattr(self, "_deleted", False):
+            return
     def _update_pen(self) -> None:
         color = QColor(self._base_color)
         if self._active_handle:
@@ -266,16 +269,16 @@ class DraggableHandle(QGraphicsEllipseItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         color = QColor(self._base_color)
         outline = QColor(40, 40, 40)
-        if option.state & QStyle.State_Selected:
+        if option.state & QStyle.StateFlag.State_Selected:
             outline = color.lighter(140)
-        elif self._hovered:
+        elif self._hovered or option.state & QStyle.StateFlag.State_MouseOver:
             outline = color.lighter(120)
         painter.setBrush(QBrush(color))
         pen = QPen(outline, 0)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.drawEllipse(self.rect())
-        if option.state & QStyle.State_Selected:
+        if option.state & QStyle.StateFlag.State_Selected:
             inner_pen = QPen(color.lighter(160), 0)
             inner_pen.setCosmetic(True)
             painter.setPen(inner_pen)
@@ -294,7 +297,7 @@ class LayerSelector(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self._label = QLabel("Слой:", self)
+        self._label = QLabel("РЎР»РѕР№:", self)
         self._slider = QSlider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
@@ -929,7 +932,7 @@ class GCodeScene(QGraphicsScene):
             self.clearSelection()
             handle.setSelected(True)
             self._update_creation_preview(handle.scenePos(), handle.scenePos())
-            self._notify('Выберите конечную точку travel-линии или нажмите на поле, чтобы задать новую.', 3500)
+            self._notify('Р’С‹Р±РµСЂРёС‚Рµ РєРѕРЅРµС‡РЅСѓСЋ С‚РѕС‡РєСѓ travel-Р»РёРЅРёРё РёР»Рё РЅР°Р¶РјРёС‚Рµ РЅР° РїРѕР»Рµ, С‡С‚РѕР±С‹ Р·Р°РґР°С‚СЊ РЅРѕРІСѓСЋ.', 3500)
             return True
         if handle is self.creation_start_handle:
             handle.setSelected(False)
@@ -942,13 +945,13 @@ class GCodeScene(QGraphicsScene):
         if self.model is None:
             return False
         if segment_item.segment.is_extrusion:
-            self._notify('Экструзионные сегменты пока нельзя разделить.', 3000)
+            self._notify('Р­РєСЃС‚СЂСѓР·РёРѕРЅРЅС‹Рµ СЃРµРіРјРµРЅС‚С‹ РїРѕРєР° РЅРµР»СЊР·СЏ СЂР°Р·РґРµР»РёС‚СЊ.', 3000)
             return False
         inserted = self.model.split_travel_command(
             segment_item.segment.end_command_index, (position.x(), position.y())
         )
         if inserted is None:
-            self._notify('Не удалось разделить выбранный сегмент.', 3000)
+            self._notify('РќРµ СѓРґР°Р»РѕСЃСЊ СЂР°Р·РґРµР»РёС‚СЊ РІС‹Р±СЂР°РЅРЅС‹Р№ СЃРµРіРјРµРЅС‚.', 3000)
             return False
         if self.creation_mode == 'travel':
             self._pending_creation_start_index = inserted
@@ -958,7 +961,7 @@ class GCodeScene(QGraphicsScene):
         self._clear_creation_preview()
         self._rebuild()
         self.gcodeChanged.emit()
-        self._notify('Сегмент разделен.', 2500)
+        self._notify('РЎРµРіРјРµРЅС‚ СЂР°Р·РґРµР»РµРЅ.', 2500)
         return True
 
     def _create_travel_move(
@@ -971,14 +974,14 @@ class GCodeScene(QGraphicsScene):
             target_point = target_handle.scenePos()
         start_point = start_handle.scenePos()
         if math.hypot(target_point.x() - start_point.x(), target_point.y() - start_point.y()) < 1e-6:
-            self._notify('Стартовая и конечная точки совпадают.', 2500)
+            self._notify('РЎС‚Р°СЂС‚РѕРІР°СЏ Рё РєРѕРЅРµС‡РЅР°СЏ С‚РѕС‡РєРё СЃРѕРІРїР°РґР°СЋС‚.', 2500)
             return False
         try:
             inserted_index = self.model.insert_travel_move(
                 start_handle.node.command_index, (target_point.x(), target_point.y())
             )
         except (IndexError, ValueError):
-            self._notify('Не удалось добавить travel-линию.', 3000)
+            self._notify('РќРµ СѓРґР°Р»РѕСЃСЊ РґРѕР±Р°РІРёС‚СЊ travel-Р»РёРЅРёСЋ.', 3000)
             return False
         if self.creation_mode == 'travel':
             if target_handle is not None:
@@ -991,7 +994,7 @@ class GCodeScene(QGraphicsScene):
         self._clear_creation_preview()
         self._rebuild()
         self.gcodeChanged.emit()
-        self._notify('Добавлена travel-линия.', 2500)
+        self._notify('Р”РѕР±Р°РІР»РµРЅР° travel-Р»РёРЅРёСЏ.', 2500)
         return True
 
     def _update_creation_preview(self, start_point: Optional[QPointF], end_point: Optional[QPointF]) -> None:
@@ -1126,10 +1129,10 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(6)
 
-        self.open_button = QPushButton("Открыть G-code…", self)
+        self.open_button = QPushButton("РћС‚РєСЂС‹С‚СЊ G-codeвЂ¦", self)
         self.open_button.clicked.connect(self.open_file)
 
-        self.save_button = QPushButton("Сохранить как…", self)
+        self.save_button = QPushButton("РЎРѕС…СЂР°РЅРёС‚СЊ РєР°РєвЂ¦", self)
         self.save_button.clicked.connect(self.save_file_as)
         self.save_button.setEnabled(False)
 
@@ -1141,22 +1144,22 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
         controls.addWidget(self.layer_selector)
 
-        self.animate_button = QPushButton("Анимация слоя", self)
+        self.animate_button = QPushButton("РђРЅРёРјР°С†РёСЏ СЃР»РѕСЏ", self)
         self.animate_button.setCheckable(True)
         self.animate_button.setEnabled(False)
         self.animate_button.toggled.connect(self._toggle_animation)
 
-        self.create_travel_button = QPushButton("Новая travel-линия", self)
+        self.create_travel_button = QPushButton("РќРѕРІР°СЏ travel-Р»РёРЅРёСЏ", self)
         self.create_travel_button.setCheckable(True)
         self.create_travel_button.setEnabled(False)
         self.create_travel_button.toggled.connect(self._on_create_travel_toggled)
 
-        self.play_pause_button = QPushButton("Пауза", self)
+        self.play_pause_button = QPushButton("РџР°СѓР·Р°", self)
         self.play_pause_button.setEnabled(False)
         self.play_pause_button.clicked.connect(self._on_play_pause_clicked)
         self._update_play_pause_button(False)
 
-        self.speed_label = QLabel("Скорость: 40 мм/с", self)
+        self.speed_label = QLabel("РЎРєРѕСЂРѕСЃС‚СЊ: 40 РјРј/СЃ", self)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.speed_slider.setRange(5, 200)
         self.speed_slider.setSingleStep(1)
@@ -1165,7 +1168,7 @@ class MainWindow(QMainWindow):
         self.speed_slider.setEnabled(False)
         self.speed_slider.valueChanged.connect(self._on_speed_changed)
 
-        self.timeline_label = QLabel("Прогресс: 0%", self)
+        self.timeline_label = QLabel("РџСЂРѕРіСЂРµСЃСЃ: 0%", self)
         self.timeline_label.setEnabled(False)
 
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal, self)
@@ -1200,8 +1203,8 @@ class MainWindow(QMainWindow):
         self.code_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self.code_view.setFont(fixed_font)
-        self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
-        self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
+        self.code_view.setPlaceholderText("Р—РґРµСЃСЊ Р±СѓРґРµС‚ РёСЃС…РѕРґРЅС‹Р№ G-code РїРѕСЃР»Рµ Р·Р°РіСЂСѓР·РєРё С„Р°Р№Р»Р°.")
+        self.code_view.setPlaceholderText("Р—РґРµСЃСЊ Р±СѓРґРµС‚ РёСЃС…РѕРґРЅС‹Р№ G-code РїРѕСЃР»Рµ Р·Р°РіСЂСѓР·РєРё С„Р°Р№Р»Р°.")
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.addWidget(self.view)
@@ -1213,20 +1216,20 @@ class MainWindow(QMainWindow):
         layout.addLayout(animation_controls)
         layout.addWidget(self.splitter, 1)
 
-        self.status_label = QLabel("Загрузите файл G-code.", self)
+        self.status_label = QLabel("Р—Р°РіСЂСѓР·РёС‚Рµ С„Р°Р№Р» G-code.", self)
         layout.addWidget(self.status_label)
 
     def open_file(self) -> None:
         dialog = QFileDialog(self)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Все файлы (*)")
+        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Р’СЃРµ С„Р°Р№Р»С‹ (*)")
         if dialog.exec() == QFileDialog.DialogCode.Accepted:
             file_path = Path(dialog.selectedFiles()[0])
             try:
                 with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
                     lines = fh.readlines()
             except OSError as exc:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл:\n{exc}")
+                QMessageBox.critical(self, "РћС€РёР±РєР°", f"РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ С„Р°Р№Р»:\n{exc}")
                 return
 
             self.model = GCodeModel(lines)
@@ -1240,12 +1243,12 @@ class MainWindow(QMainWindow):
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("Прогресс: 0%")
+            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
             self.layer_selector.set_layer_count(layer_count)
             self.save_button.setEnabled(True)
             self.current_path = file_path
             self._need_auto_fit = True
-            self.status_label.setText(f"Загружен файл: {file_path.name} ({layer_count} слоев)")
+            self.status_label.setText(f"Р—Р°РіСЂСѓР¶РµРЅ С„Р°Р№Р»: {file_path.name} ({layer_count} СЃР»РѕРµРІ)")
             self._refresh_code_view()
             self._on_layer_changed(0)
 
@@ -1256,7 +1259,7 @@ class MainWindow(QMainWindow):
         dialog = QFileDialog(self)
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setDirectory(default_dir)
-        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Все файлы (*)")
+        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Р’СЃРµ С„Р°Р№Р»С‹ (*)")
         if self.current_path:
             dialog.selectFile(self.current_path.name)
         if dialog.exec() != QFileDialog.DialogCode.Accepted:
@@ -1267,9 +1270,9 @@ class MainWindow(QMainWindow):
             content = "\n".join(self.model.rebuild())
             target_path.write_text(content, encoding="utf-8")
         except OSError as exc:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{exc}")
+            QMessageBox.critical(self, "РћС€РёР±РєР°", f"РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ С„Р°Р№Р»:\n{exc}")
             return
-        self.statusBar().showMessage(f"Файл сохранен: {target_path}", 5000)
+        self.statusBar().showMessage(f"Р¤Р°Р№Р» СЃРѕС…СЂР°РЅРµРЅ: {target_path}", 5000)
 
     def _on_layer_changed(self, layer: int) -> None:
         if self.model is None:
@@ -1303,7 +1306,7 @@ class MainWindow(QMainWindow):
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("Прогресс: 0%")
+            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
         if self._need_auto_fit:
             self.view.fit_to_rect(self.scene.sceneRect())
             self._need_auto_fit = False
@@ -1314,7 +1317,7 @@ class MainWindow(QMainWindow):
             self.view.centerOn(center)
         total_layers = self.model.get_layer_count()
         file_name = self.current_path.name if self.current_path else "G-code"
-        self.status_label.setText(f"{file_name}: слой {layer + 1} из {max(total_layers, 1)}")
+        self.status_label.setText(f"{file_name}: СЃР»РѕР№ {layer + 1} РёР· {max(total_layers, 1)}")
 
     def _refresh_code_view(self) -> None:
         if self.model is None:
@@ -1336,10 +1339,10 @@ class MainWindow(QMainWindow):
         self.play_pause_button.setEnabled(enabled)
         if not enabled:
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("Прогресс: 0%")
+            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
 
     def _update_play_pause_button(self, running: bool) -> None:
-        self.play_pause_button.setText("Пауза" if running else "Продолжить")
+        self.play_pause_button.setText("РџР°СѓР·Р°" if running else "РџСЂРѕРґРѕР»Р¶РёС‚СЊ")
 
     def _on_play_pause_clicked(self) -> None:
         if not self.scene.animation_active:
@@ -1354,7 +1357,7 @@ class MainWindow(QMainWindow):
 
     def _on_animation_progress(self, fraction: float) -> None:
         percent = max(0.0, min(fraction, 1.0)) * 100.0
-        self.timeline_label.setText(f"Прогресс: {percent:.1f}%")
+        self.timeline_label.setText(f"РџСЂРѕРіСЂРµСЃСЃ: {percent:.1f}%")
         if self._block_timeline_updates:
             return
         max_value = max(self.timeline_slider.maximum(), 1)
@@ -1369,7 +1372,7 @@ class MainWindow(QMainWindow):
     def _on_timeline_value_changed(self, value: int) -> None:
         max_value = max(self.timeline_slider.maximum(), 1)
         fraction = value / max_value
-        self.timeline_label.setText(f"Прогресс: {fraction * 100:.1f}%")
+        self.timeline_label.setText(f"РџСЂРѕРіСЂРµСЃСЃ: {fraction * 100:.1f}%")
         if self._block_timeline_updates or not self.animate_button.isChecked():
             return
         self._block_timeline_updates = True
@@ -1407,7 +1410,7 @@ class MainWindow(QMainWindow):
                 self.animate_button.setChecked(False)
             self.scene.set_creation_mode("travel")
             if self.statusBar():
-                self.statusBar().showMessage("Выберите стартовую точку travel-линии.", 4000)
+                self.statusBar().showMessage("Р’С‹Р±РµСЂРёС‚Рµ СЃС‚Р°СЂС‚РѕРІСѓСЋ С‚РѕС‡РєСѓ travel-Р»РёРЅРёРё.", 4000)
         else:
             self.scene.set_creation_mode(None)
             self.scene.clearSelection()
@@ -1428,7 +1431,7 @@ class MainWindow(QMainWindow):
                 self.animate_button.setChecked(False)
                 self._block_animation_toggle = False
                 if self.statusBar():
-                    self.statusBar().showMessage("Нет траекторий для анимации этого слоя.", 4000)
+                    self.statusBar().showMessage("РќРµС‚ С‚СЂР°РµРєС‚РѕСЂРёР№ РґР»СЏ Р°РЅРёРјР°С†РёРё СЌС‚РѕРіРѕ СЃР»РѕСЏ.", 4000)
                 self._set_timeline_controls_enabled(False)
                 self._update_play_pause_button(False)
                 self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
@@ -1436,7 +1439,7 @@ class MainWindow(QMainWindow):
                 self._set_timeline_controls_enabled(True)
                 self._update_play_pause_button(True)
                 self.timeline_slider.setValue(0)
-                self.timeline_label.setText("Прогресс: 0%")
+                self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
         else:
             self.scene.stop_animation()
             self._set_timeline_controls_enabled(False)
@@ -1446,7 +1449,7 @@ class MainWindow(QMainWindow):
     def _on_speed_changed(self, value: int) -> None:
         if self._block_speed_updates:
             return
-        self.speed_label.setText(f"Скорость: {value} мм/с")
+        self.speed_label.setText(f"РЎРєРѕСЂРѕСЃС‚СЊ: {value} РјРј/СЃ")
         self.scene.set_animation_speed(value)
 
     def _on_animation_state_changed(self, running: bool) -> None:
@@ -1468,7 +1471,7 @@ class MainWindow(QMainWindow):
             self._update_play_pause_button(False)
             self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
             if self.statusBar():
-                self.statusBar().showMessage("Анимация остановлена.", 2000)
+                self.statusBar().showMessage("РђРЅРёРјР°С†РёСЏ РѕСЃС‚Р°РЅРѕРІР»РµРЅР°.", 2000)
 
 def main() -> None:
     import sys
