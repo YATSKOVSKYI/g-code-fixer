@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -278,3 +279,97 @@ class GCodeModel:
                 if hasattr(state, attr):
                     setattr(state, attr, value)
             command.state_after = state.copy()
+
+    def insert_travel_move(self, after_command_index: int, target: Tuple[float, float]) -> int:
+        if after_command_index < 0 or after_command_index >= len(self.commands):
+            raise IndexError("after_command_index out of range")
+
+        base_command = self.commands[after_command_index]
+        params: Dict[str, float] = {
+            "X": float(target[0]),
+            "Y": float(target[1]),
+        }
+
+        z_value = base_command.state_after.z
+        if z_value is None:
+            z_value = base_command.state_before.z
+        if z_value is not None:
+            params["Z"] = float(z_value)
+
+        new_index = max((cmd.index for cmd in self.commands), default=-1) + 1
+        new_command = GCodeCommand(
+            original="",
+            command="G0",
+            params=params,
+            comment="added travel",
+            index=new_index,
+            layer=base_command.layer,
+        )
+        new_command.layer = base_command.layer
+        self.commands.insert(after_command_index + 1, new_command)
+        self.recompute_states()
+        return after_command_index + 1
+
+    def split_travel_command(self, command_index: int, position: Tuple[float, float]) -> Optional[int]:
+        if command_index < 0 or command_index >= len(self.commands):
+            return None
+
+        command = self.commands[command_index]
+        if not command.is_move():
+            return None
+
+        start_state = command.state_before
+        end_state = command.state_after
+        if (
+            start_state.x is None
+            or start_state.y is None
+            or end_state.x is None
+            or end_state.y is None
+        ):
+            return None
+
+        e_before = start_state.e
+        e_after = end_state.e
+        if e_before is not None and e_after is not None and abs(e_after - e_before) > 1e-6:
+            return None
+
+        start_point = (start_state.x, start_state.y)
+        end_point = (end_state.x, end_state.y)
+        dx = end_point[0] - start_point[0]
+        dy = end_point[1] - start_point[1]
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-9:
+            return None
+
+        px, py = position
+        t = ((px - start_point[0]) * dx + (py - start_point[1]) * dy) / length_sq
+        t = max(0.0, min(1.0, t))
+        proj_x = start_point[0] + dx * t
+        proj_y = start_point[1] + dy * t
+
+        if math.hypot(proj_x - px, proj_y - py) > 0.5:
+            return None
+        if t <= 0.001 or t >= 0.999:
+            return None
+
+        original_params = dict(command.params)
+        command.params["X"] = proj_x
+        command.params["Y"] = proj_y
+
+        new_params = dict(original_params)
+        new_params["X"] = end_point[0]
+        new_params["Y"] = end_point[1]
+
+        new_index = max((cmd.index for cmd in self.commands), default=-1) + 1
+        new_command = GCodeCommand(
+            original="",
+            command=command.command,
+            params=new_params,
+            comment=command.comment,
+            index=new_index,
+            layer=command.layer,
+        )
+        new_command.layer = command.layer
+        self.commands.insert(command_index + 1, new_command)
+        self.recompute_states()
+        return command_index + 1

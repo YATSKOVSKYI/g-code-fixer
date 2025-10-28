@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen
+from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen, QBrush, QTransform
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -29,6 +29,8 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
+    QStyle,
+    QStyleOptionGraphicsItem,
 )
 
 from .gcode_parser import GCodeModel, GCodeNode, GCodeSegment
@@ -56,12 +58,19 @@ class SegmentItem(QGraphicsLineItem):
         self.end_handle: Optional["DraggableHandle"] = None
         self.static_start: Optional[QPointF] = None
         self.static_end: Optional[QPointF] = None
-        self.setPen(QPen(color, 0))
+        self._base_color = QColor(color)
+        pen = QPen(self._base_color, 0)
+        pen.setCosmetic(True)
+        self.setPen(pen)
         self.setZValue(0)
         self.setAcceptHoverEvents(True)
-        self._base_color = color
         self._active_handle: Optional["DraggableHandle"] = None
         self._hovered = False
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
+        )
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_start_handle(self, handle: "DraggableHandle") -> None:
         self.start_handle = handle
@@ -91,11 +100,16 @@ class SegmentItem(QGraphicsLineItem):
         self._update_pen()
 
     def _update_pen(self) -> None:
-        width = 0.0 if not self._hovered else 0.6
         color = QColor(self._base_color)
         if self._active_handle:
-            color = QColor(255, 220, 0) if self.segment.is_extrusion else QColor(180, 220, 255)
-        self.setPen(QPen(color, width))
+            color = color.lighter(150)
+        elif self.isSelected():
+            color = color.lighter(130)
+        elif self._hovered:
+            color = color.lighter(115)
+        pen = QPen(color, 0)
+        pen.setCosmetic(True)
+        self.setPen(pen)
 
     def hoverEnterEvent(self, event) -> None:
         self._hovered = True
@@ -150,9 +164,26 @@ class SegmentItem(QGraphicsLineItem):
                 segment.refresh()
             if handle.commit_callback:
                 handle.commit_callback(handle, handle.scenePos())
+            self._update_pen()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene = self.scene()
+            if isinstance(scene, GCodeScene) and scene.split_segment_at(self, event.scenePos()):
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
+        if change in {
+            QGraphicsItem.GraphicsItemChange.ItemSelectedChange,
+            QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged,
+        }:
+            self._update_pen()
+        return super().itemChange(change, value)
 
 
 class DraggableHandle(QGraphicsEllipseItem):
@@ -169,8 +200,12 @@ class DraggableHandle(QGraphicsEllipseItem):
         self.node = node
         self.commit_callback = commit_callback
         self._segments: list[tuple[SegmentItem, bool]] = []
-        self.setBrush(color)
-        self.setPen(QPen(QColor(30, 30, 30), 0))
+        self._base_color = QColor(color)
+        self._hovered = False
+        self.setBrush(QBrush(self._base_color))
+        outline = QPen(QColor(40, 40, 40), 0)
+        outline.setCosmetic(True)
+        self.setPen(outline)
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable
             | QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges
@@ -179,6 +214,8 @@ class DraggableHandle(QGraphicsEllipseItem):
         self.setZValue(10)
         self.setPos(QPointF(*node.position))
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def attach_segment(self, segment: SegmentItem, is_start: bool) -> None:
         self._segments.append((segment, is_start))
@@ -187,13 +224,63 @@ class DraggableHandle(QGraphicsEllipseItem):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for segment, _ in self._segments:
                 segment.refresh()
+        if change in {
+            QGraphicsItem.GraphicsItemChange.ItemSelectedChange,
+            QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged,
+        }:
+            self.update()
         return super().itemChange(change, value)
+
+    def mousePressEvent(self, event):
+        scene = self.scene()
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and isinstance(scene, GCodeScene)
+            and scene.creation_mode == "travel"
+        ):
+            if scene.handle_creation_click(self):
+                event.accept()
+                return
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
         if self.commit_callback:
             position = self.scenePos()
             self.commit_callback(self, position)
+        self.update()
+
+    def hoverEnterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().hoverLeaveEvent(event)
+
+    def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor(self._base_color)
+        outline = QColor(40, 40, 40)
+        if option.state & QStyle.State_Selected:
+            outline = color.lighter(140)
+        elif self._hovered:
+            outline = color.lighter(120)
+        painter.setBrush(QBrush(color))
+        pen = QPen(outline, 0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawEllipse(self.rect())
+        if option.state & QStyle.State_Selected:
+            inner_pen = QPen(color.lighter(160), 0)
+            inner_pen.setCosmetic(True)
+            painter.setPen(inner_pen)
+            shrink = self.rect().adjusted(0.2, 0.2, -0.2, -0.2)
+            painter.drawEllipse(shrink)
 
 
 class LayerSelector(QWidget):
@@ -304,6 +391,10 @@ class GCodeScene(QGraphicsScene):
         self.animation_progress = 0.0
         self.animation_last_time = 0.0
         self.animation_visuals_hidden = False
+        self.creation_mode: Optional[str] = None
+        self.creation_start_handle: Optional[DraggableHandle] = None
+        self.creation_preview: Optional[QGraphicsLineItem] = None
+        self._pending_creation_start_index: Optional[int] = None
 
     def set_model(self, model: Optional[GCodeModel]) -> None:
         self.stop_animation(emit=False)
@@ -318,6 +409,12 @@ class GCodeScene(QGraphicsScene):
         self.animation_prefix = []
         self.animation_total_length = 0.0
         self.animation_active = False
+        self.creation_mode = None
+        self.creation_start_handle = None
+        if self.creation_preview is not None:
+            self.removeItem(self.creation_preview)
+            self.creation_preview = None
+        self._pending_creation_start_index = None
 
     def set_layer(self, layer: int) -> None:
         if self.model is None:
@@ -327,6 +424,9 @@ class GCodeScene(QGraphicsScene):
         self._rebuild()
 
     def _rebuild(self) -> None:
+        prev_start_index = None
+        if self.creation_mode == "travel" and self.creation_start_handle is not None:
+            prev_start_index = self.creation_start_handle.node.command_index
         self.stop_animation(emit=False)
         self.clear()
         self.handles.clear()
@@ -376,6 +476,29 @@ class GCodeScene(QGraphicsScene):
         self.animation_segments = segments
         self._prepare_animation_data()
         self._emit_progress()
+        if self.creation_mode == "travel":
+            target_index = (
+                self._pending_creation_start_index
+                if self._pending_creation_start_index is not None
+                else prev_start_index
+            )
+            if target_index is not None:
+                handle = self.handles.get(target_index)
+                if handle:
+                    self.creation_start_handle = handle
+                    self.clearSelection()
+                    handle.setSelected(True)
+                    self._update_creation_preview(handle.scenePos(), handle.scenePos())
+                else:
+                    self.creation_start_handle = None
+                    self._clear_creation_preview()
+            else:
+                self.creation_start_handle = None
+                self._clear_creation_preview()
+        else:
+            self.creation_start_handle = None
+            self._clear_creation_preview()
+        self._pending_creation_start_index = None
 
         bounds = self.model.get_bounds(self.current_layer)
         if bounds:
@@ -434,6 +557,7 @@ class GCodeScene(QGraphicsScene):
             self.stop_animation()
             return False
 
+        self.set_creation_mode(None)
         self.stop_animation(emit=False)
         if not self._prepare_animation_items():
             self.stop_animation()
@@ -774,6 +898,155 @@ class GCodeScene(QGraphicsScene):
             current = self.animation_lengths[self.animation_index] * self.animation_progress
         return completed + current
 
+    def set_creation_mode(self, mode: Optional[str]) -> None:
+        if mode == self.creation_mode:
+            return
+        if mode is None:
+            if self.creation_start_handle:
+                self.creation_start_handle.setSelected(False)
+            self.creation_mode = None
+            self.creation_start_handle = None
+            self._pending_creation_start_index = None
+            self._clear_creation_preview()
+            return
+        if mode == "travel":
+            self.creation_mode = mode
+            self.creation_start_handle = None
+            self._pending_creation_start_index = None
+            self._clear_creation_preview()
+            self._set_items_for_animation(False)
+        else:
+            self.creation_mode = None
+            self.creation_start_handle = None
+            self._pending_creation_start_index = None
+            self._clear_creation_preview()
+
+    def handle_creation_click(self, handle: DraggableHandle) -> bool:
+        if self.creation_mode != "travel":
+            return False
+        if self.creation_start_handle is None:
+            self.creation_start_handle = handle
+            self.clearSelection()
+            handle.setSelected(True)
+            self._update_creation_preview(handle.scenePos(), handle.scenePos())
+            self._notify('Выберите конечную точку travel-линии или нажмите на поле, чтобы задать новую.', 3500)
+            return True
+        if handle is self.creation_start_handle:
+            handle.setSelected(False)
+            self.creation_start_handle = None
+            self._clear_creation_preview()
+            return True
+        return self._create_travel_move(self.creation_start_handle, handle.scenePos(), handle)
+
+    def split_segment_at(self, segment_item: SegmentItem, position: QPointF) -> bool:
+        if self.model is None:
+            return False
+        if segment_item.segment.is_extrusion:
+            self._notify('Экструзионные сегменты пока нельзя разделить.', 3000)
+            return False
+        inserted = self.model.split_travel_command(
+            segment_item.segment.end_command_index, (position.x(), position.y())
+        )
+        if inserted is None:
+            self._notify('Не удалось разделить выбранный сегмент.', 3000)
+            return False
+        if self.creation_mode == 'travel':
+            self._pending_creation_start_index = inserted
+        else:
+            self._pending_creation_start_index = None
+        self.creation_start_handle = None
+        self._clear_creation_preview()
+        self._rebuild()
+        self.gcodeChanged.emit()
+        self._notify('Сегмент разделен.', 2500)
+        return True
+
+    def _create_travel_move(
+        self, start_handle: DraggableHandle, target_pos: QPointF, target_handle: Optional[DraggableHandle]
+    ) -> bool:
+        if self.model is None:
+            return False
+        target_point = QPointF(target_pos)
+        if target_handle is not None:
+            target_point = target_handle.scenePos()
+        start_point = start_handle.scenePos()
+        if math.hypot(target_point.x() - start_point.x(), target_point.y() - start_point.y()) < 1e-6:
+            self._notify('Стартовая и конечная точки совпадают.', 2500)
+            return False
+        try:
+            inserted_index = self.model.insert_travel_move(
+                start_handle.node.command_index, (target_point.x(), target_point.y())
+            )
+        except (IndexError, ValueError):
+            self._notify('Не удалось добавить travel-линию.', 3000)
+            return False
+        if self.creation_mode == 'travel':
+            if target_handle is not None:
+                self._pending_creation_start_index = target_handle.node.command_index
+            else:
+                self._pending_creation_start_index = inserted_index
+        else:
+            self._pending_creation_start_index = None
+        self.creation_start_handle = None
+        self._clear_creation_preview()
+        self._rebuild()
+        self.gcodeChanged.emit()
+        self._notify('Добавлена travel-линия.', 2500)
+        return True
+
+    def _update_creation_preview(self, start_point: Optional[QPointF], end_point: Optional[QPointF]) -> None:
+        if self.creation_mode != 'travel' or start_point is None:
+            self._clear_creation_preview()
+            return
+        if end_point is None:
+            end_point = start_point
+        if self.creation_preview is None:
+            preview = QGraphicsLineItem()
+            pen = QPen(QColor(200, 200, 200, 160), 0)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            preview.setPen(pen)
+            preview.setZValue(2)
+            self.addItem(preview)
+            self.creation_preview = preview
+        self.creation_preview.setLine(
+            start_point.x(), start_point.y(), end_point.x(), end_point.y()
+        )
+
+    def _clear_creation_preview(self) -> None:
+        if self.creation_preview is not None:
+            self.removeItem(self.creation_preview)
+            self.creation_preview = None
+
+    def _notify(self, message: str, timeout: int = 3000) -> None:
+        for view in self.views():
+            window = view.window()
+            if hasattr(window, 'statusBar'):
+                try:
+                    window.statusBar().showMessage(message, timeout)
+                except Exception:  # pragma: no cover - UI guard
+                    pass
+                break
+
+    def mousePressEvent(self, event):
+        if (
+            self.creation_mode == 'travel'
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.creation_start_handle is not None
+        ):
+            transform = self.views()[0].transform() if self.views() else QTransform()
+            item = self.itemAt(event.scenePos(), transform)
+            if not isinstance(item, DraggableHandle):
+                if self._create_travel_move(self.creation_start_handle, event.scenePos(), None):
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.creation_mode == 'travel' and self.creation_start_handle is not None:
+            self._update_creation_preview(self.creation_start_handle.scenePos(), event.scenePos())
+        super().mouseMoveEvent(event)
+
     def _emit_progress(self) -> None:
         if not self.animation_segments or self.animation_total_length <= 1e-6:
             progress = 0.0
@@ -839,6 +1112,7 @@ class MainWindow(QMainWindow):
         self._block_animation_toggle: bool = False
         self._block_speed_updates: bool = False
         self._block_timeline_updates: bool = False
+        self._block_creation_toggle: bool = False
         self._timeline_was_running: bool = False
         self._timeline_dragging: bool = False
 
@@ -872,6 +1146,11 @@ class MainWindow(QMainWindow):
         self.animate_button.setEnabled(False)
         self.animate_button.toggled.connect(self._toggle_animation)
 
+        self.create_travel_button = QPushButton("Новая travel-линия", self)
+        self.create_travel_button.setCheckable(True)
+        self.create_travel_button.setEnabled(False)
+        self.create_travel_button.toggled.connect(self._on_create_travel_toggled)
+
         self.play_pause_button = QPushButton("Пауза", self)
         self.play_pause_button.setEnabled(False)
         self.play_pause_button.clicked.connect(self._on_play_pause_clicked)
@@ -902,6 +1181,7 @@ class MainWindow(QMainWindow):
         animation_controls = QHBoxLayout()
         animation_controls.setSpacing(6)
         animation_controls.addWidget(self.animate_button)
+        animation_controls.addWidget(self.create_travel_button)
         animation_controls.addWidget(self.play_pause_button)
         animation_controls.addWidget(self.speed_label)
         animation_controls.addWidget(self.speed_slider, 1)
@@ -920,7 +1200,7 @@ class MainWindow(QMainWindow):
         self.code_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self.code_view.setFont(fixed_font)
-        self.code_view.setMinimumWidth(260)
+        self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
         self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -997,6 +1277,11 @@ class MainWindow(QMainWindow):
         self.layer_selector.set_layer(layer)
         self.scene.set_layer(layer)
         has_segments = bool(self.scene.animation_segments)
+        if not has_segments and self.create_travel_button.isChecked():
+            self._block_creation_toggle = True
+            self.create_travel_button.setChecked(False)
+            self._block_creation_toggle = False
+        self.create_travel_button.setEnabled(has_segments and not self.animate_button.isChecked())
         if not has_segments and self.animate_button.isChecked():
             self._block_animation_toggle = True
             self.animate_button.setChecked(False)
@@ -1004,6 +1289,7 @@ class MainWindow(QMainWindow):
         self.animate_button.setEnabled(has_segments)
         self._set_speed_controls_enabled(has_segments)
         if self.animate_button.isChecked():
+            self.create_travel_button.setEnabled(False)
             self.scene.set_animation_speed(self.speed_slider.value())
             if not self.scene.start_animation():
                 self._block_animation_toggle = True
@@ -1113,18 +1399,39 @@ class MainWindow(QMainWindow):
             self.scene.resume_animation()
         self._timeline_was_running = False
 
+    def _on_create_travel_toggled(self, checked: bool) -> None:
+        if self._block_creation_toggle:
+            return
+        if checked:
+            if self.animate_button.isChecked():
+                self.animate_button.setChecked(False)
+            self.scene.set_creation_mode("travel")
+            if self.statusBar():
+                self.statusBar().showMessage("Выберите стартовую точку travel-линии.", 4000)
+        else:
+            self.scene.set_creation_mode(None)
+            self.scene.clearSelection()
+            if self.statusBar():
+                self.statusBar().clearMessage()
+
     def _toggle_animation(self, checked: bool) -> None:
         if self._block_animation_toggle:
             return
         if checked:
+            self._block_creation_toggle = True
+            self.create_travel_button.setChecked(False)
+            self._block_creation_toggle = False
+            self.create_travel_button.setEnabled(False)
             self.scene.set_animation_speed(self.speed_slider.value())
             if not self.scene.start_animation():
                 self._block_animation_toggle = True
                 self.animate_button.setChecked(False)
                 self._block_animation_toggle = False
-                self.statusBar().showMessage("��� ���������� ��� �������� ����� ����.", 4000)
+                if self.statusBar():
+                    self.statusBar().showMessage("Нет траекторий для анимации этого слоя.", 4000)
                 self._set_timeline_controls_enabled(False)
                 self._update_play_pause_button(False)
+                self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
             else:
                 self._set_timeline_controls_enabled(True)
                 self._update_play_pause_button(True)
@@ -1134,6 +1441,7 @@ class MainWindow(QMainWindow):
             self.scene.stop_animation()
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
+            self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
 
     def _on_speed_changed(self, value: int) -> None:
         if self._block_speed_updates:
@@ -1149,14 +1457,18 @@ class MainWindow(QMainWindow):
             self.animate_button.setChecked(running)
             self._block_animation_toggle = False
         if running:
+            self._block_creation_toggle = True
+            self.create_travel_button.setChecked(False)
+            self._block_creation_toggle = False
+            self.create_travel_button.setEnabled(False)
             self._set_timeline_controls_enabled(True)
             self._update_play_pause_button(self.scene.animation_running)
         else:
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
+            self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
             if self.statusBar():
                 self.statusBar().showMessage("Анимация остановлена.", 2000)
-
 
 def main() -> None:
     import sys
