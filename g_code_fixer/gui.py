@@ -7,6 +7,10 @@ from bisect import bisect_left
 from pathlib import Path
 from typing import Dict, List, Optional
 
+try:
+    from PyQt6 import sip as _sip
+except ImportError:  # pragma: no cover
+    _sip = None
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen, QBrush, QTransform
 from PyQt6.QtWidgets import (
@@ -103,6 +107,10 @@ class SegmentItem(QGraphicsLineItem):
         if getattr(self, "_deleted", False):
             return
     def _update_pen(self) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
+        if self.scene() is None:
+            return
         color = QColor(self._base_color)
         if self._active_handle:
             color = color.lighter(150)
