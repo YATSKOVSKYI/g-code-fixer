@@ -258,10 +258,22 @@ class GCodeModel:
     def update_command_position(self, command_index: int, x: Optional[float], y: Optional[float]) -> None:
         """Update the XY values of a command and recompute dependent states."""
         command = self.commands[command_index]
+        old_x = command.params.get("X")
+        old_y = command.params.get("Y")
+
         if x is not None:
             command.params["X"] = x
         if y is not None:
             command.params["Y"] = y
+
+        # Add comment about modification
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if old_x is not None and old_y is not None:
+            command.comment = f"Modified {timestamp}: was ({old_x:.2f}, {old_y:.2f})"
+        else:
+            command.comment = f"Modified {timestamp}"
+
         self.recompute_states()
 
     def recompute_states(self) -> None:
@@ -296,12 +308,17 @@ class GCodeModel:
         if z_value is not None:
             params["Z"] = float(z_value)
 
+        # Add timestamp comment
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        comment = f"Added travel at {timestamp}"
+
         new_index = max((cmd.index for cmd in self.commands), default=-1) + 1
         new_command = GCodeCommand(
             original="",
             command="G0",
             params=params,
-            comment="added travel",
+            comment=comment,
             index=new_index,
             layer=base_command.layer,
         )
@@ -382,6 +399,16 @@ class GCodeModel:
         command = self.commands[command_index]
         if not command.is_move():
             raise ValueError("Can only delete move commands")
+
+        # Add comment to previous command about deletion
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        if command_index > 0:
+            prev_cmd = self.commands[command_index - 1]
+            if prev_cmd.comment:
+                prev_cmd.comment += f" | Deleted command at {timestamp}"
+            else:
+                prev_cmd.comment = f"Command deleted here at {timestamp}"
 
         del self.commands[command_index]
         self.recompute_states()

@@ -13,7 +13,7 @@ try:
     from PyQt6 import sip as _sip
 except ImportError:  # pragma: no cover
     _sip = None
-from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal, QSize
 from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen, QBrush, QTransform, QKeySequence, QFont, QIcon, QAction
 from PyQt6.QtWidgets import (
     QApplication,
@@ -191,10 +191,12 @@ class SegmentItem(QGraphicsLineItem):
         self.static_start: Optional[QPointF] = None
         self.static_end: Optional[QPointF] = None
         self._base_color = QColor(color)
-        pen = QPen(self._base_color, 0)
-        pen.setCosmetic(True)
+        pen = QPen(self._base_color, 0.4)  # Scene units width for better visibility
+        pen.setCosmetic(False)  # Use scene coordinates, not screen pixels
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         self.setPen(pen)
-        self.setZValue(0)
+        self.setZValue(1)  # Поднял над фоном
         self.setAcceptHoverEvents(True)
         self._active_handle: Optional["DraggableHandle"] = None
         self._hovered = False
@@ -203,6 +205,20 @@ class SegmentItem(QGraphicsLineItem):
             | QGraphicsItem.GraphicsItemFlag.ItemIsFocusable
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Ensure visible by default
+        self.setVisible(True)
+
+    def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None):
+        """Override paint to ensure lines are always visible."""
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(self.pen())
+
+        line = self.line()
+        if line.length() > 0:
+            painter.drawLine(line)
 
     def set_start_handle(self, handle: "DraggableHandle") -> None:
         self.start_handle = handle
@@ -237,21 +253,23 @@ class SegmentItem(QGraphicsLineItem):
         if (_sip and _sip.isdeleted(self)) or self.scene() is None:
             return
         color = QColor(self._base_color)
-        width = 0
+        width = 0.4  # Scene units width
 
         if self._active_handle:
             color = color.lighter(150)
-            width = 2.0
+            width = 0.6
         elif self.isSelected():
             # CAD-style selection: bright cyan highlight
             color = QColor(0, 255, 255)
-            width = 2.5
+            width = 0.8
         elif self._hovered:
             color = color.lighter(140)
-            width = 1.5
+            width = 0.5
 
         pen = QPen(color, width)
-        pen.setCosmetic(True)
+        pen.setCosmetic(False)  # Use scene coordinates
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         if self.isSelected():
             pen.setStyle(Qt.PenStyle.SolidLine)
         self.setPen(pen)
@@ -310,6 +328,10 @@ class SegmentItem(QGraphicsLineItem):
             self._active_handle.setPos(event.scenePos())
             for segment, _ in list(self._active_handle._segments):
                 segment.refresh()
+            # Real-time dimension/angle updates during drag
+            scene = self.scene()
+            if isinstance(scene, GCodeScene):
+                scene.update_dimensions()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -464,6 +486,15 @@ class DraggableHandle(QGraphicsEllipseItem):
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        """Handle mouse move events for real-time dimension updates."""
+        super().mouseMoveEvent(event)
+        # Real-time dimension/angle updates during drag
+        if not (_sip and _sip.isdeleted(self)):
+            scene = self.scene()
+            if isinstance(scene, GCodeScene):
+                scene.update_dimensions()
+
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
         # Check if object is still valid
@@ -555,6 +586,118 @@ class DraggableHandle(QGraphicsEllipseItem):
             break
 
         event.accept()
+
+
+class PropertiesPanel(QWidget):
+    """Panel showing properties of selected items."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Title
+        title = QLabel("<b>Свойства выделенного</b>", self)
+        layout.addWidget(title)
+
+        # Properties form
+        form_widget = QWidget(self)
+        self.form_layout = QFormLayout(form_widget)
+        self.form_layout.setContentsMargins(0, 0, 0, 0)
+        self.form_layout.setSpacing(4)
+
+        # Coordinate fields
+        self.x_coord = QLineEdit(self)
+        self.x_coord.setReadOnly(True)
+        self.y_coord = QLineEdit(self)
+        self.y_coord.setReadOnly(True)
+
+        # Distance field
+        self.distance = QLineEdit(self)
+        self.distance.setReadOnly(True)
+
+        # Angle field
+        self.angle = QLineEdit(self)
+        self.angle.setReadOnly(True)
+
+        # Type field
+        self.item_type = QLineEdit(self)
+        self.item_type.setReadOnly(True)
+
+        # Command index
+        self.cmd_index = QLineEdit(self)
+        self.cmd_index.setReadOnly(True)
+
+        self.form_layout.addRow("X:", self.x_coord)
+        self.form_layout.addRow("Y:", self.y_coord)
+        self.form_layout.addRow("Длина:", self.distance)
+        self.form_layout.addRow("Угол:", self.angle)
+        self.form_layout.addRow("Тип:", self.item_type)
+        self.form_layout.addRow("Индекс:", self.cmd_index)
+
+        layout.addWidget(form_widget)
+        layout.addStretch()
+
+        self.setMaximumWidth(250)
+        self.setMinimumWidth(200)
+
+    def update_selection(self, selected_items: List):
+        """Update properties based on selected items."""
+        if not selected_items:
+            self.clear()
+            return
+
+        if len(selected_items) == 1:
+            item = selected_items[0]
+            if isinstance(item, DraggableHandle):
+                self._show_handle_properties(item)
+            elif isinstance(item, SegmentItem):
+                self._show_segment_properties(item)
+        else:
+            self._show_multiple_selection(selected_items)
+
+    def _show_handle_properties(self, handle: DraggableHandle):
+        pos = handle.scenePos()
+        self.x_coord.setText(f"{pos.x():.3f} мм")
+        self.y_coord.setText(f"{pos.y():.3f} мм")
+        self.distance.setText("-")
+        self.angle.setText("-")
+        self.item_type.setText("Экструзия" if handle.node.is_extrusion else "Travel")
+        self.cmd_index.setText(f"{handle.node.command_index}")
+
+    def _show_segment_properties(self, segment: SegmentItem):
+        line = segment.line()
+        start = QPointF(line.x1(), line.y1())
+        end = QPointF(line.x2(), line.y2())
+        length = math.hypot(end.x() - start.x(), end.y() - start.y())
+        angle_rad = math.atan2(end.y() - start.y(), end.x() - start.x())
+        angle_deg = math.degrees(angle_rad)
+
+        self.x_coord.setText(f"({start.x():.2f}, {start.y():.2f})")
+        self.y_coord.setText(f"({end.x():.2f}, {end.y():.2f})")
+        self.distance.setText(f"{length:.3f} мм")
+        self.angle.setText(f"{angle_deg:.1f}°")
+        self.item_type.setText("Экструзия" if segment.segment.is_extrusion else "Travel")
+        self.cmd_index.setText(f"{segment.segment.end_command_index}")
+
+    def _show_multiple_selection(self, items: List):
+        count = len(items)
+        self.x_coord.setText(f"Выбрано: {count}")
+        self.y_coord.setText("-")
+        self.distance.setText("-")
+        self.angle.setText("-")
+        self.item_type.setText("Несколько")
+        self.cmd_index.setText("-")
+
+    def clear(self):
+        """Clear all fields."""
+        self.x_coord.setText("-")
+        self.y_coord.setText("-")
+        self.distance.setText("-")
+        self.angle.setText("-")
+        self.item_type.setText("-")
+        self.cmd_index.setText("-")
 
 
 class LayerSelector(QWidget):
@@ -798,6 +941,15 @@ class GCodeScene(QGraphicsScene):
             self.setSceneRect(*rect)
         else:
             self.setSceneRect(-10, -10, 20, 20)
+
+        # Ensure all items are visible if not animating
+        if not self.animation_active:
+            for item in self.segment_items:
+                item.setVisible(True)
+            for handle in self.handles.values():
+                handle.setVisible(True)
+            for anchor in self.anchor_items:
+                anchor.setVisible(True)
 
     def _handle_commit(self, handle: DraggableHandle, position: QPointF) -> None:
         if self.model is None or self.current_layer is None:
@@ -1304,6 +1456,11 @@ class GCodeScene(QGraphicsScene):
             return
         if end_point is None:
             end_point = start_point
+
+        # Check if preview was deleted
+        if self.creation_preview is not None and (_sip and _sip.isdeleted(self.creation_preview)):
+            self.creation_preview = None
+
         if self.creation_preview is None:
             preview = QGraphicsLineItem()
             pen = QPen(QColor(200, 200, 200, 160), 0)
@@ -1313,13 +1470,19 @@ class GCodeScene(QGraphicsScene):
             preview.setZValue(2)
             self.addItem(preview)
             self.creation_preview = preview
-        self.creation_preview.setLine(
-            start_point.x(), start_point.y(), end_point.x(), end_point.y()
-        )
+
+        if not (_sip and _sip.isdeleted(self.creation_preview)):
+            self.creation_preview.setLine(
+                start_point.x(), start_point.y(), end_point.x(), end_point.y()
+            )
 
     def _clear_creation_preview(self) -> None:
         if self.creation_preview is not None:
-            self.removeItem(self.creation_preview)
+            if not (_sip and _sip.isdeleted(self.creation_preview)):
+                try:
+                    self.removeItem(self.creation_preview)
+                except RuntimeError:
+                    pass  # Already deleted
             self.creation_preview = None
 
     def _notify(self, message: str, timeout: int = 3000) -> None:
@@ -1365,15 +1528,27 @@ class GCodeScene(QGraphicsScene):
         if self.animation_visuals_hidden == active:
             return
         visible = not active
-        for item in self.segment_items:
-            item.setVisible(visible)
-        for handle in self.handles.values():
-            handle.setVisible(visible)
-        for anchor in self.anchor_items:
-            anchor.setVisible(visible)
-        # Hide dimensions during animation
-        for dim in self.dimension_items:
-            dim.setVisible(visible)
+
+        # Only hide during animation, not in edit mode
+        if active:
+            for item in self.segment_items:
+                item.setVisible(visible)
+            for handle in self.handles.values():
+                handle.setVisible(visible)
+            for anchor in self.anchor_items:
+                anchor.setVisible(visible)
+            # Hide dimensions during animation
+            for dim in self.dimension_items:
+                dim.setVisible(visible)
+        else:
+            # Show everything when not animating
+            for item in self.segment_items:
+                item.setVisible(True)
+            for handle in self.handles.values():
+                handle.setVisible(True)
+            for anchor in self.anchor_items:
+                anchor.setVisible(True)
+
         self.animation_visuals_hidden = active
 
     def update_dimensions(self) -> None:
@@ -1656,8 +1831,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("G-code Fixer")
-        self.resize(1200, 800)
+        self.setWindowTitle("G-code Fixer - CAD Редактор")
+        self.resize(1400, 900)
 
         self.model: Optional[GCodeModel] = None
         self.current_path: Optional[Path] = None
@@ -1668,6 +1843,9 @@ class MainWindow(QMainWindow):
         self._block_creation_toggle: bool = False
         self._timeline_was_running: bool = False
         self._timeline_dragging: bool = False
+
+        # Create toolbar
+        self._create_toolbar()
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -1756,8 +1934,13 @@ class MainWindow(QMainWindow):
         self.scene.animationStateChanged.connect(self._on_animation_state_changed)
         self.scene.animationPlayingChanged.connect(self._on_animation_playing_changed)
         self.scene.animationProgressChanged.connect(self._on_animation_progress)
+        self.scene.selectionChanged.connect(self._on_selection_changed)
         self.scene.set_animation_speed(self.speed_slider.value())
         self.view = GraphicsView(self.scene)
+
+        # Properties panel
+        self.properties_panel = PropertiesPanel(self)
+
         self.code_view = QPlainTextEdit(self)
         self.code_view.setReadOnly(True)
         self.code_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -1766,10 +1949,12 @@ class MainWindow(QMainWindow):
         self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.splitter.addWidget(self.properties_panel)
         self.splitter.addWidget(self.view)
         self.splitter.addWidget(self.code_view)
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 4)
+        self.splitter.setStretchFactor(2, 2)
 
         layout.addLayout(controls)
         layout.addLayout(animation_controls)
@@ -2039,6 +2224,84 @@ class MainWindow(QMainWindow):
     def _on_snap_toggled(self, checked: bool) -> None:
         """Toggle snap to grid."""
         self.scene.set_snap_to_grid(checked)
+
+    def _create_toolbar(self):
+        """Create CAD-style toolbar with mode buttons."""
+        toolbar = QToolBar("Инструменты", self)
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(32, 32))
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+
+        # Mode button group (mutually exclusive)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+
+        # Select mode
+        self.select_action = QAction("✋ Выбор", self)
+        self.select_action.setCheckable(True)
+        self.select_action.setChecked(True)
+        self.select_action.setToolTip("Режим выбора (S)")
+        self.select_action.setShortcut(QKeySequence("S"))
+        self.select_action.triggered.connect(lambda: self._set_edit_mode(EditMode.SELECT))
+        toolbar.addAction(self.select_action)
+        self.mode_group.addButton(toolbar.widgetForAction(self.select_action))
+
+        # Draw Extrusion mode
+        self.draw_extrusion_action = QAction("✏ Экструзия", self)
+        self.draw_extrusion_action.setCheckable(True)
+        self.draw_extrusion_action.setToolTip("Рисовать экструзию (E)")
+        self.draw_extrusion_action.setShortcut(QKeySequence("E"))
+        self.draw_extrusion_action.triggered.connect(lambda: self._set_edit_mode(EditMode.DRAW_EXTRUSION))
+        toolbar.addAction(self.draw_extrusion_action)
+        self.mode_group.addButton(toolbar.widgetForAction(self.draw_extrusion_action))
+
+        # Draw Travel mode
+        self.draw_travel_action = QAction("📍 Travel", self)
+        self.draw_travel_action.setCheckable(True)
+        self.draw_travel_action.setToolTip("Рисовать travel-линию (T)")
+        self.draw_travel_action.setShortcut(QKeySequence("T"))
+        self.draw_travel_action.triggered.connect(lambda: self._set_edit_mode(EditMode.DRAW_TRAVEL))
+        toolbar.addAction(self.draw_travel_action)
+        self.mode_group.addButton(toolbar.widgetForAction(self.draw_travel_action))
+
+        toolbar.addSeparator()
+
+        # Delete mode
+        self.delete_action = QAction("🗑 Удалить", self)
+        self.delete_action.setCheckable(True)
+        self.delete_action.setToolTip("Удалить выделенное (Delete)")
+        self.delete_action.triggered.connect(lambda: self.scene.delete_selected_items())
+        toolbar.addAction(self.delete_action)
+
+        toolbar.addSeparator()
+
+        # Measure mode
+        self.measure_action = QAction("📏 Измерить", self)
+        self.measure_action.setCheckable(True)
+        self.measure_action.setToolTip("Режим измерений (M)")
+        self.measure_action.setShortcut(QKeySequence("M"))
+        self.measure_action.triggered.connect(lambda: self._set_edit_mode(EditMode.MEASURE))
+        toolbar.addAction(self.measure_action)
+        self.mode_group.addButton(toolbar.widgetForAction(self.measure_action))
+
+        toolbar.addSeparator()
+
+        # View controls
+        self.zoom_fit_action = QAction("🔍 По размеру", self)
+        self.zoom_fit_action.setToolTip("Вписать в окно (F)")
+        self.zoom_fit_action.setShortcut(QKeySequence("F"))
+        self.zoom_fit_action.triggered.connect(lambda: self.view.fit_to_rect(self.scene.sceneRect()))
+        toolbar.addAction(self.zoom_fit_action)
+
+    def _set_edit_mode(self, mode: EditMode):
+        """Change the editing mode."""
+        self.scene.edit_mode = mode
+        self.statusBar().showMessage(f"Режим: {mode.value}", 2000)
+
+    def _on_selection_changed(self):
+        """Update properties panel when selection changes."""
+        selected = self.scene.selectedItems()
+        self.properties_panel.update_selection(selected)
 
 def main() -> None:
     import sys
