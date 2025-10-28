@@ -5,14 +5,16 @@ import os
 import time
 from bisect import bisect_left
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+from datetime import datetime
 
 try:
     from PyQt6 import sip as _sip
 except ImportError:  # pragma: no cover
     _sip = None
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen, QBrush, QTransform
+from PyQt6.QtGui import QColor, QFontDatabase, QPainter, QPainterPath, QPen, QBrush, QTransform, QKeySequence, QFont, QIcon, QAction
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -35,9 +37,134 @@ from PyQt6.QtWidgets import (
     QWidget,
     QStyle,
     QStyleOptionGraphicsItem,
+    QMenu,
+    QGraphicsTextItem,
+    QCheckBox,
+    QToolBar,
+    QButtonGroup,
+    QGroupBox,
+    QFormLayout,
+    QLineEdit,
+    QDoubleSpinBox,
 )
 
 from .gcode_parser import GCodeModel, GCodeNode, GCodeSegment
+
+
+class EditMode(Enum):
+    """Editing modes for the CAD-like editor."""
+    SELECT = "select"
+    DRAW_EXTRUSION = "draw_extrusion"
+    DRAW_TRAVEL = "draw_travel"
+    DELETE = "delete"
+    MEASURE = "measure"
+
+
+class AngleItem(QGraphicsItem):
+    """Visual angle indicator between two segments."""
+
+    def __init__(self, vertex: QPointF, angle_deg: float, radius: float = 5.0):
+        super().__init__()
+        self.vertex = vertex
+        self.angle_deg = angle_deg
+        self.radius = radius
+        self.text_item: Optional[QGraphicsTextItem] = None
+        self.setPos(vertex)
+        self.setZValue(16)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self._create_text()
+
+    def _create_text(self):
+        if self.text_item is None and self.scene():
+            self.text_item = QGraphicsTextItem()
+            font = QFont("Arial", 9, QFont.Weight.Bold)
+            self.text_item.setFont(font)
+            self.text_item.setDefaultTextColor(QColor(100, 255, 100))
+            self.text_item.setZValue(17)
+            self.text_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+            self.scene().addItem(self.text_item)
+
+        if self.text_item:
+            self.text_item.setPlainText(f"{self.angle_deg:.1f}°")
+            self.text_item.setPos(self.vertex.x() + 8, self.vertex.y() + 8)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(-self.radius, -self.radius, self.radius * 2, self.radius * 2)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        # Draw small arc at vertex
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(100, 255, 100, 200), 0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        # Simple visual indicator
+        painter.drawEllipse(QPointF(0, 0), 2, 2)
+
+    def remove_from_scene(self):
+        if self.text_item and self.text_item.scene():
+            self.text_item.scene().removeItem(self.text_item)
+        self.text_item = None
+
+
+class DimensionItem(QGraphicsLineItem):
+    """Visual dimension line showing distance between two points."""
+
+    def __init__(self, start: QPointF, end: QPointF):
+        super().__init__()
+        self.start_point = start
+        self.end_point = end
+        self.text_item: Optional[QGraphicsTextItem] = None
+        self.update_geometry()
+
+        # Style the dimension line
+        pen = QPen(QColor(255, 255, 100, 200), 0)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        self.setPen(pen)
+        self.setZValue(15)
+
+    def update_geometry(self) -> None:
+        """Update the line and text based on start and end points."""
+        self.setLine(self.start_point.x(), self.start_point.y(),
+                     self.end_point.x(), self.end_point.y())
+
+        # Calculate distance
+        dx = self.end_point.x() - self.start_point.x()
+        dy = self.end_point.y() - self.start_point.y()
+        distance = math.hypot(dx, dy)
+
+        # Update or create text item
+        if self.text_item is None and self.scene():
+            self.text_item = QGraphicsTextItem()
+            font = QFont("Arial", 8)
+            self.text_item.setFont(font)
+            self.text_item.setDefaultTextColor(QColor(255, 255, 150))
+            self.text_item.setZValue(16)
+            self.text_item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+            self.scene().addItem(self.text_item)
+
+        if self.text_item:
+            # Position text at midpoint
+            mid_x = (self.start_point.x() + self.end_point.x()) / 2
+            mid_y = (self.start_point.y() + self.end_point.y()) / 2
+
+            # Calculate angle
+            angle = math.degrees(math.atan2(dy, dx))
+
+            self.text_item.setPlainText(f"{distance:.2f} мм")
+            self.text_item.setPos(mid_x, mid_y)
+
+    def set_points(self, start: QPointF, end: QPointF) -> None:
+        """Update the dimension with new points."""
+        self.start_point = start
+        self.end_point = end
+        self.update_geometry()
+
+    def remove_from_scene(self) -> None:
+        """Clean up text item when removing from scene."""
+        if self.text_item and self.text_item.scene():
+            self.text_item.scene().removeItem(self.text_item)
+        self.text_item = None
 
 
 class StaticAnchorItem(QGraphicsEllipseItem):
@@ -98,36 +225,47 @@ class SegmentItem(QGraphicsLineItem):
         self.refresh()
 
     def refresh(self) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
         start = self.start_handle.scenePos() if self.start_handle else self.static_start
         end = self.end_handle.scenePos() if self.end_handle else self.static_end
         if start and end:
             self.setLine(start.x(), start.y(), end.x(), end.y())
         self._update_pen()
 
-        if getattr(self, "_deleted", False):
-            return
     def _update_pen(self) -> None:
         if (_sip and _sip.isdeleted(self)) or self.scene() is None:
             return
-        if self.scene() is None:
-            return
         color = QColor(self._base_color)
+        width = 0
+
         if self._active_handle:
             color = color.lighter(150)
+            width = 2.0
         elif self.isSelected():
-            color = color.lighter(130)
+            # CAD-style selection: bright cyan highlight
+            color = QColor(0, 255, 255)
+            width = 2.5
         elif self._hovered:
-            color = color.lighter(115)
-        pen = QPen(color, 0)
+            color = color.lighter(140)
+            width = 1.5
+
+        pen = QPen(color, width)
         pen.setCosmetic(True)
+        if self.isSelected():
+            pen.setStyle(Qt.PenStyle.SolidLine)
         self.setPen(pen)
 
     def hoverEnterEvent(self, event) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
         self._hovered = True
         self._update_pen()
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
         self._hovered = False
         self._update_pen()
         super().hoverLeaveEvent(event)
@@ -155,9 +293,19 @@ class SegmentItem(QGraphicsLineItem):
                 chosen.setPos(scene_pos)
                 event.accept()
                 return
+
+            # Multi-selection support for segments
+            modifiers = event.modifiers()
+            if not (modifiers & Qt.KeyboardModifier.ControlModifier):
+                # Clear other selections if Ctrl is not pressed
+                scene = self.scene()
+                if scene and not self.isSelected():
+                    scene.clearSelection()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
         if self._active_handle:
             self._active_handle.setPos(event.scenePos())
             for segment, _ in list(self._active_handle._segments):
@@ -167,14 +315,17 @@ class SegmentItem(QGraphicsLineItem):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
         if self._active_handle:
             handle = self._active_handle
             self._active_handle = None
-            handle.setPos(event.scenePos())
-            for segment, _ in list(handle._segments):
-                segment.refresh()
-            if handle.commit_callback:
-                handle.commit_callback(handle, handle.scenePos())
+            if not (_sip and _sip.isdeleted(handle)):
+                handle.setPos(event.scenePos())
+                for segment, _ in list(handle._segments):
+                    segment.refresh()
+                if handle.commit_callback:
+                    handle.commit_callback(handle, handle.scenePos())
             self._update_pen()
             event.accept()
             return
@@ -188,12 +339,49 @@ class SegmentItem(QGraphicsLineItem):
                 return
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event) -> None:
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return
+        scene = self.scene()
+        if not isinstance(scene, GCodeScene):
+            return
+
+        menu = QMenu()
+        split_action = menu.addAction("Разделить сегмент в этой точке")
+        delete_action = menu.addAction("Удалить сегмент")
+        menu.addSeparator()
+
+        if self.segment.is_extrusion:
+            convert_action = menu.addAction("Преобразовать в travel")
+        else:
+            convert_action = menu.addAction("Преобразовать в экструзию")
+
+        # Show menu at cursor position
+        for view in scene.views():
+            action = menu.exec(event.screenPos())
+            if not (_sip and _sip.isdeleted(self)):
+                if action == split_action:
+                    scene.split_segment_at(self, event.scenePos())
+                elif action == delete_action:
+                    scene.delete_segment(self)
+                elif action == convert_action:
+                    scene.convert_segment(self)
+            break
+
+        event.accept()
+
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
+        if (_sip and _sip.isdeleted(self)) or self.scene() is None:
+            return super().itemChange(change, value)
         if change in {
             QGraphicsItem.GraphicsItemChange.ItemSelectedChange,
             QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged,
         }:
             self._update_pen()
+            # Update dimensions when selection changes
+            scene = self.scene()
+            if isinstance(scene, GCodeScene):
+                scene.update_dimensions()
         return super().itemChange(change, value)
 
 
@@ -232,17 +420,29 @@ class DraggableHandle(QGraphicsEllipseItem):
         self._segments.append((segment, is_start))
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value):
+        if _sip and _sip.isdeleted(self):
+            return super().itemChange(change, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for segment, _ in self._segments:
                 segment.refresh()
+            # Update dimensions when handle moves
+            scene = self.scene()
+            if isinstance(scene, GCodeScene):
+                scene.update_dimensions()
         if change in {
             QGraphicsItem.GraphicsItemChange.ItemSelectedChange,
             QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged,
         }:
             self.update()
+            # Update dimensions when selection changes
+            scene = self.scene()
+            if isinstance(scene, GCodeScene):
+                scene.update_dimensions()
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event):
+        if _sip and _sip.isdeleted(self):
+            return
         scene = self.scene()
         if (
             event.button() == Qt.MouseButton.LeftButton
@@ -252,23 +452,41 @@ class DraggableHandle(QGraphicsEllipseItem):
             if scene.handle_creation_click(self):
                 event.accept()
                 return
+
+        # Multi-selection support
+        if event.button() == Qt.MouseButton.LeftButton:
+            modifiers = event.modifiers()
+            if not (modifiers & Qt.KeyboardModifier.ControlModifier):
+                # Clear other selections if Ctrl is not pressed
+                if scene and not self.isSelected():
+                    scene.clearSelection()
+
         self.setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
         super().mouseReleaseEvent(event)
+        # Check if object is still valid
+        if _sip and _sip.isdeleted(self):
+            return
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         if self.commit_callback:
             position = self.scenePos()
             self.commit_callback(self, position)
-        self.update()
+        # Check again after callback (rebuild might have deleted this)
+        if not (_sip and _sip.isdeleted(self)):
+            self.update()
 
     def hoverEnterEvent(self, event):
+        if _sip and _sip.isdeleted(self):
+            return
         self._hovered = True
         self.update()
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
+        if _sip and _sip.isdeleted(self):
+            return
         self._hovered = False
         self.update()
         super().hoverLeaveEvent(event)
@@ -277,21 +495,66 @@ class DraggableHandle(QGraphicsEllipseItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         color = QColor(self._base_color)
         outline = QColor(40, 40, 40)
+        outline_width = 0
+
         if option.state & QStyle.StateFlag.State_Selected:
-            outline = color.lighter(140)
+            # CAD-style selection: bright cyan with glow effect
+            outline = QColor(0, 255, 255)
+            outline_width = 2.0
+            # Draw outer glow
+            glow_pen = QPen(QColor(0, 255, 255, 100), 4.0)
+            glow_pen.setCosmetic(True)
+            painter.setPen(glow_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawEllipse(self.rect())
         elif self._hovered or option.state & QStyle.StateFlag.State_MouseOver:
-            outline = color.lighter(120)
+            outline = color.lighter(150)
+            outline_width = 1.5
+
+        # Draw main circle
         painter.setBrush(QBrush(color))
-        pen = QPen(outline, 0)
+        pen = QPen(outline, outline_width)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.drawEllipse(self.rect())
+
         if option.state & QStyle.StateFlag.State_Selected:
-            inner_pen = QPen(color.lighter(160), 0)
-            inner_pen.setCosmetic(True)
-            painter.setPen(inner_pen)
-            shrink = self.rect().adjusted(0.2, 0.2, -0.2, -0.2)
-            painter.drawEllipse(shrink)
+            # Draw center cross for selected handles
+            painter.setPen(QPen(QColor(0, 255, 255), 0))
+            rect = self.rect()
+            center_x = rect.center().x()
+            center_y = rect.center().y()
+            size = rect.width() * 0.4
+            painter.drawLine(QPointF(center_x - size, center_y), QPointF(center_x + size, center_y))
+            painter.drawLine(QPointF(center_x, center_y - size), QPointF(center_x, center_y + size))
+
+    def contextMenuEvent(self, event) -> None:
+        if _sip and _sip.isdeleted(self):
+            return
+        scene = self.scene()
+        if not isinstance(scene, GCodeScene):
+            return
+
+        menu = QMenu()
+        delete_action = menu.addAction("Удалить точку")
+        menu.addSeparator()
+
+        if self.node.is_extrusion:
+            convert_action = menu.addAction("Преобразовать в travel")
+        else:
+            convert_action = menu.addAction("Преобразовать в экструзию")
+
+        # Show menu at cursor position
+        for view in scene.views():
+            action = menu.exec(event.screenPos())
+            if not (_sip and _sip.isdeleted(self)):
+                if action == delete_action:
+                    scene.delete_handle(self)
+                elif action == convert_action:
+                    scene.convert_handle(self)
+            break
+
+        event.accept()
 
 
 class LayerSelector(QWidget):
@@ -305,7 +568,7 @@ class LayerSelector(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        self._label = QLabel("РЎР»РѕР№:", self)
+        self._label = QLabel("Слой:", self)
         self._slider = QSlider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(0)
         self._slider.setMaximum(0)
@@ -378,6 +641,15 @@ class GCodeScene(QGraphicsScene):
         self.handles: Dict[int, DraggableHandle] = {}
         self.anchor_items: List[QGraphicsItem] = []
         self.segment_items: List[SegmentItem] = []
+        self.dimension_items: List[DimensionItem] = []
+        self.angle_items: List[AngleItem] = []
+        self.show_dimensions: bool = True
+        self.show_angles: bool = True
+        self.snap_to_grid: bool = False
+        self.grid_size: float = 1.0  # 1mm grid
+        self.edit_mode: EditMode = EditMode.SELECT
+        self.drawing_points: List[QPointF] = []
+        self.drawing_preview: Optional[QGraphicsLineItem] = None
         self.extrusion_color = QColor(220, 90, 40)
         self.travel_color = QColor(70, 130, 200)
         self.anchor_color = QColor(210, 210, 210)
@@ -531,9 +803,30 @@ class GCodeScene(QGraphicsScene):
         if self.model is None or self.current_layer is None:
             return
         self.stop_animation()
+
+        # Apply grid snapping if enabled
+        if self.snap_to_grid:
+            position = self._snap_to_grid(position)
+
         self.model.update_command_position(handle.node.command_index, position.x(), position.y())
         self._rebuild()
         self.gcodeChanged.emit()
+
+    def _snap_to_grid(self, point: QPointF) -> QPointF:
+        """Snap a point to the nearest grid intersection."""
+        if not self.snap_to_grid or self.grid_size <= 0:
+            return point
+        x = round(point.x() / self.grid_size) * self.grid_size
+        y = round(point.y() / self.grid_size) * self.grid_size
+        return QPointF(x, y)
+
+    def set_snap_to_grid(self, enabled: bool) -> None:
+        """Enable or disable grid snapping."""
+        self.snap_to_grid = enabled
+        if enabled:
+            self._notify(f'Привязка к сетке включена (шаг {self.grid_size} мм).', 2500)
+        else:
+            self._notify('Привязка к сетке отключена.', 2500)
 
     def _find_previous_handle(self, command_index: int) -> Optional[DraggableHandle]:
         if self.model is None:
@@ -940,7 +1233,7 @@ class GCodeScene(QGraphicsScene):
             self.clearSelection()
             handle.setSelected(True)
             self._update_creation_preview(handle.scenePos(), handle.scenePos())
-            self._notify('Р’С‹Р±РµСЂРёС‚Рµ РєРѕРЅРµС‡РЅСѓСЋ С‚РѕС‡РєСѓ travel-Р»РёРЅРёРё РёР»Рё РЅР°Р¶РјРёС‚Рµ РЅР° РїРѕР»Рµ, С‡С‚РѕР±С‹ Р·Р°РґР°С‚СЊ РЅРѕРІСѓСЋ.', 3500)
+            self._notify('Выберите конечную точку travel-линии или нажмите на поле, чтобы задать новую.', 3500)
             return True
         if handle is self.creation_start_handle:
             handle.setSelected(False)
@@ -953,13 +1246,13 @@ class GCodeScene(QGraphicsScene):
         if self.model is None:
             return False
         if segment_item.segment.is_extrusion:
-            self._notify('Р­РєСЃС‚СЂСѓР·РёРѕРЅРЅС‹Рµ СЃРµРіРјРµРЅС‚С‹ РїРѕРєР° РЅРµР»СЊР·СЏ СЂР°Р·РґРµР»РёС‚СЊ.', 3000)
+            self._notify('Экструзионные сегменты пока нельзя разделить.', 3000)
             return False
         inserted = self.model.split_travel_command(
             segment_item.segment.end_command_index, (position.x(), position.y())
         )
         if inserted is None:
-            self._notify('РќРµ СѓРґР°Р»РѕСЃСЊ СЂР°Р·РґРµР»РёС‚СЊ РІС‹Р±СЂР°РЅРЅС‹Р№ СЃРµРіРјРµРЅС‚.', 3000)
+            self._notify('Не удалось разделить выбранный сегмент.', 3000)
             return False
         if self.creation_mode == 'travel':
             self._pending_creation_start_index = inserted
@@ -969,7 +1262,7 @@ class GCodeScene(QGraphicsScene):
         self._clear_creation_preview()
         self._rebuild()
         self.gcodeChanged.emit()
-        self._notify('РЎРµРіРјРµРЅС‚ СЂР°Р·РґРµР»РµРЅ.', 2500)
+        self._notify('Сегмент разделён.', 2500)
         return True
 
     def _create_travel_move(
@@ -982,14 +1275,14 @@ class GCodeScene(QGraphicsScene):
             target_point = target_handle.scenePos()
         start_point = start_handle.scenePos()
         if math.hypot(target_point.x() - start_point.x(), target_point.y() - start_point.y()) < 1e-6:
-            self._notify('РЎС‚Р°СЂС‚РѕРІР°СЏ Рё РєРѕРЅРµС‡РЅР°СЏ С‚РѕС‡РєРё СЃРѕРІРїР°РґР°СЋС‚.', 2500)
+            self._notify('Стартовая и конечная точки совпадают.', 2500)
             return False
         try:
             inserted_index = self.model.insert_travel_move(
                 start_handle.node.command_index, (target_point.x(), target_point.y())
             )
         except (IndexError, ValueError):
-            self._notify('РќРµ СѓРґР°Р»РѕСЃСЊ РґРѕР±Р°РІРёС‚СЊ travel-Р»РёРЅРёСЋ.', 3000)
+            self._notify('Не удалось добавить travel-линию.', 3000)
             return False
         if self.creation_mode == 'travel':
             if target_handle is not None:
@@ -1002,7 +1295,7 @@ class GCodeScene(QGraphicsScene):
         self._clear_creation_preview()
         self._rebuild()
         self.gcodeChanged.emit()
-        self._notify('Р”РѕР±Р°РІР»РµРЅР° travel-Р»РёРЅРёСЏ.', 2500)
+        self._notify('Добавлена travel-линия.', 2500)
         return True
 
     def _update_creation_preview(self, start_point: Optional[QPointF], end_point: Optional[QPointF]) -> None:
@@ -1078,7 +1371,209 @@ class GCodeScene(QGraphicsScene):
             handle.setVisible(visible)
         for anchor in self.anchor_items:
             anchor.setVisible(visible)
+        # Hide dimensions during animation
+        for dim in self.dimension_items:
+            dim.setVisible(visible)
         self.animation_visuals_hidden = active
+
+    def update_dimensions(self) -> None:
+        """Update dimension lines and angles for selected items."""
+        # Clear existing dimensions and angles
+        for dim in self.dimension_items:
+            dim.remove_from_scene()
+            if dim.scene():
+                self.removeItem(dim)
+        self.dimension_items.clear()
+
+        for angle_item in self.angle_items:
+            angle_item.remove_from_scene()
+            if angle_item.scene():
+                self.removeItem(angle_item)
+        self.angle_items.clear()
+
+        if not self.show_dimensions and not self.show_angles:
+            return
+
+        # Get all selected items
+        selected = self.selectedItems()
+        selected_segments = [item for item in selected if isinstance(item, SegmentItem)]
+        selected_handles = [item for item in selected if isinstance(item, DraggableHandle)]
+
+        # Show dimensions for selected segments
+        if self.show_dimensions:
+            for segment_item in selected_segments:
+                start = QPointF(segment_item.line().x1(), segment_item.line().y1())
+                end = QPointF(segment_item.line().x2(), segment_item.line().y2())
+                dim = DimensionItem(start, end)
+                self.addItem(dim)
+                self.dimension_items.append(dim)
+
+            # Show dimensions between consecutive selected handles
+            if len(selected_handles) >= 2:
+                # Sort handles by command index
+                sorted_handles = sorted(selected_handles, key=lambda h: h.node.command_index)
+                for i in range(len(sorted_handles) - 1):
+                    start = sorted_handles[i].scenePos()
+                    end = sorted_handles[i + 1].scenePos()
+                    dim = DimensionItem(start, end)
+                    self.addItem(dim)
+                    self.dimension_items.append(dim)
+
+        # Show angles between consecutive segments
+        if self.show_angles and len(selected_handles) >= 3:
+            sorted_handles = sorted(selected_handles, key=lambda h: h.node.command_index)
+            for i in range(1, len(sorted_handles) - 1):
+                prev_pos = sorted_handles[i - 1].scenePos()
+                curr_pos = sorted_handles[i].scenePos()
+                next_pos = sorted_handles[i + 1].scenePos()
+
+                # Calculate angle
+                angle = self._calculate_angle(prev_pos, curr_pos, next_pos)
+                if angle is not None:
+                    angle_item = AngleItem(curr_pos, angle)
+                    self.addItem(angle_item)
+                    self.angle_items.append(angle_item)
+
+    def _calculate_angle(self, p1: QPointF, vertex: QPointF, p2: QPointF) -> Optional[float]:
+        """Calculate angle at vertex between three points in degrees."""
+        # Vector from vertex to p1
+        v1_x = p1.x() - vertex.x()
+        v1_y = p1.y() - vertex.y()
+
+        # Vector from vertex to p2
+        v2_x = p2.x() - vertex.x()
+        v2_y = p2.y() - vertex.y()
+
+        # Calculate lengths
+        len1 = math.hypot(v1_x, v1_y)
+        len2 = math.hypot(v2_x, v2_y)
+
+        if len1 < 1e-6 or len2 < 1e-6:
+            return None
+
+        # Normalize vectors
+        v1_x /= len1
+        v1_y /= len1
+        v2_x /= len2
+        v2_y /= len2
+
+        # Calculate dot product
+        dot = v1_x * v2_x + v1_y * v2_y
+        dot = max(-1.0, min(1.0, dot))  # Clamp to avoid numerical errors
+
+        # Calculate angle in degrees
+        angle_rad = math.acos(dot)
+        angle_deg = math.degrees(angle_rad)
+
+        return angle_deg
+
+    def toggle_dimensions(self, show: bool) -> None:
+        """Toggle dimension display on/off."""
+        self.show_dimensions = show
+        if not show:
+            for dim in self.dimension_items:
+                dim.remove_from_scene()
+                if dim.scene():
+                    self.removeItem(dim)
+            self.dimension_items.clear()
+        else:
+            self.update_dimensions()
+
+    def delete_segment(self, segment_item: SegmentItem) -> bool:
+        """Delete a segment by removing its end command."""
+        if self.model is None:
+            return False
+        try:
+            self.model.delete_command(segment_item.segment.end_command_index)
+            self._rebuild()
+            self.gcodeChanged.emit()
+            self._notify('Сегмент удалён.', 2500)
+            return True
+        except (IndexError, ValueError) as e:
+            self._notify(f'Не удалось удалить сегмент: {e}', 3000)
+            return False
+
+    def convert_segment(self, segment_item: SegmentItem) -> bool:
+        """Convert segment between extrusion and travel."""
+        if self.model is None:
+            return False
+        try:
+            self.model.toggle_extrusion(segment_item.segment.end_command_index)
+            self._rebuild()
+            self.gcodeChanged.emit()
+            seg_type = "travel" if segment_item.segment.is_extrusion else "экструзию"
+            self._notify(f'Сегмент преобразован в {seg_type}.', 2500)
+            return True
+        except (IndexError, ValueError) as e:
+            self._notify(f'Не удалось преобразовать сегмент: {e}', 3000)
+            return False
+
+    def delete_handle(self, handle: DraggableHandle) -> bool:
+        """Delete a point (handle) by removing its command."""
+        if self.model is None:
+            return False
+        try:
+            self.model.delete_command(handle.node.command_index)
+            self._rebuild()
+            self.gcodeChanged.emit()
+            self._notify('Точка удалена.', 2500)
+            return True
+        except (IndexError, ValueError) as e:
+            self._notify(f'Не удалось удалить точку: {e}', 3000)
+            return False
+
+    def convert_handle(self, handle: DraggableHandle) -> bool:
+        """Convert handle command between extrusion and travel."""
+        if self.model is None:
+            return False
+        try:
+            self.model.toggle_extrusion(handle.node.command_index)
+            self._rebuild()
+            self.gcodeChanged.emit()
+            cmd_type = "travel" if handle.node.is_extrusion else "экструзию"
+            self._notify(f'Команда преобразована в {cmd_type}.', 2500)
+            return True
+        except (IndexError, ValueError) as e:
+            self._notify(f'Не удалось преобразовать команду: {e}', 3000)
+            return False
+
+    def delete_selected_items(self) -> bool:
+        """Delete all selected segments and handles."""
+        if self.model is None:
+            return False
+
+        selected = self.selectedItems()
+        selected_segments = [item for item in selected if isinstance(item, SegmentItem)]
+        selected_handles = [item for item in selected if isinstance(item, DraggableHandle)]
+
+        # Get indices to delete (avoid duplicates)
+        indices_to_delete = set()
+        for segment in selected_segments:
+            indices_to_delete.add(segment.segment.end_command_index)
+        for handle in selected_handles:
+            indices_to_delete.add(handle.node.command_index)
+
+        if not indices_to_delete:
+            return False
+
+        # Sort in reverse order to delete from end to start (preserves indices)
+        sorted_indices = sorted(indices_to_delete, reverse=True)
+
+        deleted_count = 0
+        for idx in sorted_indices:
+            try:
+                self.model.delete_command(idx)
+                deleted_count += 1
+            except (IndexError, ValueError):
+                pass
+
+        if deleted_count > 0:
+            self._rebuild()
+            self.gcodeChanged.emit()
+            self._notify(f'Удалено элементов: {deleted_count}', 2500)
+            return True
+
+        return False
 
 
 class GraphicsView(QGraphicsView):
@@ -1092,6 +1587,53 @@ class GraphicsView(QGraphicsView):
         self.scale(1, -1)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QColor(30, 30, 30))
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts."""
+        scene = self.scene()
+        if not isinstance(scene, GCodeScene):
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+        modifiers = event.modifiers()
+
+        # Delete key: delete selected items
+        if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            selected = scene.selectedItems()
+            if selected:
+                scene.delete_selected_items()
+                event.accept()
+                return
+
+        # Escape: deselect all
+        elif key == Qt.Key.Key_Escape:
+            scene.clearSelection()
+            event.accept()
+            return
+
+        # Ctrl+A: select all
+        elif key == Qt.Key.Key_A and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            for item in scene.items():
+                if isinstance(item, (SegmentItem, DraggableHandle)):
+                    item.setSelected(True)
+            event.accept()
+            return
+
+        # D key: toggle dimensions
+        elif key == Qt.Key.Key_D and not (modifiers & Qt.KeyboardModifier.ControlModifier):
+            scene.toggle_dimensions(not scene.show_dimensions)
+            event.accept()
+            return
+
+        # G key: toggle grid snap
+        elif key == Qt.Key.Key_G:
+            scene.set_snap_to_grid(not scene.snap_to_grid)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         angle = event.angleDelta().y()
@@ -1137,10 +1679,10 @@ class MainWindow(QMainWindow):
         controls = QHBoxLayout()
         controls.setSpacing(6)
 
-        self.open_button = QPushButton("РћС‚РєСЂС‹С‚СЊ G-codeвЂ¦", self)
+        self.open_button = QPushButton("Открыть G-code…", self)
         self.open_button.clicked.connect(self.open_file)
 
-        self.save_button = QPushButton("РЎРѕС…СЂР°РЅРёС‚СЊ РєР°РєвЂ¦", self)
+        self.save_button = QPushButton("Сохранить как…", self)
         self.save_button.clicked.connect(self.save_file_as)
         self.save_button.setEnabled(False)
 
@@ -1152,22 +1694,30 @@ class MainWindow(QMainWindow):
         controls.addStretch(1)
         controls.addWidget(self.layer_selector)
 
-        self.animate_button = QPushButton("РђРЅРёРјР°С†РёСЏ СЃР»РѕСЏ", self)
+        self.animate_button = QPushButton("Анимация слоя", self)
         self.animate_button.setCheckable(True)
         self.animate_button.setEnabled(False)
         self.animate_button.toggled.connect(self._toggle_animation)
 
-        self.create_travel_button = QPushButton("РќРѕРІР°СЏ travel-Р»РёРЅРёСЏ", self)
+        self.create_travel_button = QPushButton("Новая travel-линия", self)
         self.create_travel_button.setCheckable(True)
         self.create_travel_button.setEnabled(False)
         self.create_travel_button.toggled.connect(self._on_create_travel_toggled)
 
-        self.play_pause_button = QPushButton("РџР°СѓР·Р°", self)
+        self.show_dimensions_checkbox = QCheckBox("Показать размеры", self)
+        self.show_dimensions_checkbox.setChecked(True)
+        self.show_dimensions_checkbox.toggled.connect(self._on_dimensions_toggled)
+
+        self.snap_to_grid_checkbox = QCheckBox("Привязка к сетке", self)
+        self.snap_to_grid_checkbox.setChecked(False)
+        self.snap_to_grid_checkbox.toggled.connect(self._on_snap_toggled)
+
+        self.play_pause_button = QPushButton("Пауза", self)
         self.play_pause_button.setEnabled(False)
         self.play_pause_button.clicked.connect(self._on_play_pause_clicked)
         self._update_play_pause_button(False)
 
-        self.speed_label = QLabel("РЎРєРѕСЂРѕСЃС‚СЊ: 40 РјРј/СЃ", self)
+        self.speed_label = QLabel("Скорость: 40 мм/с", self)
         self.speed_slider = QSlider(Qt.Orientation.Horizontal, self)
         self.speed_slider.setRange(5, 200)
         self.speed_slider.setSingleStep(1)
@@ -1176,7 +1726,7 @@ class MainWindow(QMainWindow):
         self.speed_slider.setEnabled(False)
         self.speed_slider.valueChanged.connect(self._on_speed_changed)
 
-        self.timeline_label = QLabel("РџСЂРѕРіСЂРµСЃСЃ: 0%", self)
+        self.timeline_label = QLabel("Прогресс: 0%", self)
         self.timeline_label.setEnabled(False)
 
         self.timeline_slider = QSlider(Qt.Orientation.Horizontal, self)
@@ -1193,6 +1743,8 @@ class MainWindow(QMainWindow):
         animation_controls.setSpacing(6)
         animation_controls.addWidget(self.animate_button)
         animation_controls.addWidget(self.create_travel_button)
+        animation_controls.addWidget(self.show_dimensions_checkbox)
+        animation_controls.addWidget(self.snap_to_grid_checkbox)
         animation_controls.addWidget(self.play_pause_button)
         animation_controls.addWidget(self.speed_label)
         animation_controls.addWidget(self.speed_slider, 1)
@@ -1211,8 +1763,7 @@ class MainWindow(QMainWindow):
         self.code_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         self.code_view.setFont(fixed_font)
-        self.code_view.setPlaceholderText("Р—РґРµСЃСЊ Р±СѓРґРµС‚ РёСЃС…РѕРґРЅС‹Р№ G-code РїРѕСЃР»Рµ Р·Р°РіСЂСѓР·РєРё С„Р°Р№Р»Р°.")
-        self.code_view.setPlaceholderText("Р—РґРµСЃСЊ Р±СѓРґРµС‚ РёСЃС…РѕРґРЅС‹Р№ G-code РїРѕСЃР»Рµ Р·Р°РіСЂСѓР·РєРё С„Р°Р№Р»Р°.")
+        self.code_view.setPlaceholderText("Здесь будет исходный G-code после загрузки файла.")
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.addWidget(self.view)
@@ -1224,20 +1775,20 @@ class MainWindow(QMainWindow):
         layout.addLayout(animation_controls)
         layout.addWidget(self.splitter, 1)
 
-        self.status_label = QLabel("Р—Р°РіСЂСѓР·РёС‚Рµ С„Р°Р№Р» G-code.", self)
+        self.status_label = QLabel("Загрузите файл G-code.", self)
         layout.addWidget(self.status_label)
 
     def open_file(self) -> None:
         dialog = QFileDialog(self)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Р’СЃРµ С„Р°Р№Р»С‹ (*)")
+        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Все файлы (*)")
         if dialog.exec() == QFileDialog.DialogCode.Accepted:
             file_path = Path(dialog.selectedFiles()[0])
             try:
                 with file_path.open("r", encoding="utf-8", errors="ignore") as fh:
                     lines = fh.readlines()
             except OSError as exc:
-                QMessageBox.critical(self, "РћС€РёР±РєР°", f"РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ С„Р°Р№Р»:\n{exc}")
+                QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл:\n{exc}")
                 return
 
             self.model = GCodeModel(lines)
@@ -1251,12 +1802,12 @@ class MainWindow(QMainWindow):
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
+            self.timeline_label.setText("Прогресс: 0%")
             self.layer_selector.set_layer_count(layer_count)
             self.save_button.setEnabled(True)
             self.current_path = file_path
             self._need_auto_fit = True
-            self.status_label.setText(f"Р—Р°РіСЂСѓР¶РµРЅ С„Р°Р№Р»: {file_path.name} ({layer_count} СЃР»РѕРµРІ)")
+            self.status_label.setText(f"Загружен файл: {file_path.name} ({layer_count} слоёв)")
             self._refresh_code_view()
             self._on_layer_changed(0)
 
@@ -1267,7 +1818,7 @@ class MainWindow(QMainWindow):
         dialog = QFileDialog(self)
         dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         dialog.setDirectory(default_dir)
-        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Р’СЃРµ С„Р°Р№Р»С‹ (*)")
+        dialog.setNameFilter("G-code (*.gcode *.gco *.gc *.nc);;Все файлы (*)")
         if self.current_path:
             dialog.selectFile(self.current_path.name)
         if dialog.exec() != QFileDialog.DialogCode.Accepted:
@@ -1278,9 +1829,9 @@ class MainWindow(QMainWindow):
             content = "\n".join(self.model.rebuild())
             target_path.write_text(content, encoding="utf-8")
         except OSError as exc:
-            QMessageBox.critical(self, "РћС€РёР±РєР°", f"РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ С„Р°Р№Р»:\n{exc}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{exc}")
             return
-        self.statusBar().showMessage(f"Р¤Р°Р№Р» СЃРѕС…СЂР°РЅРµРЅ: {target_path}", 5000)
+        self.statusBar().showMessage(f"Файл сохранён: {target_path}", 5000)
 
     def _on_layer_changed(self, layer: int) -> None:
         if self.model is None:
@@ -1314,7 +1865,7 @@ class MainWindow(QMainWindow):
             self._set_timeline_controls_enabled(False)
             self._update_play_pause_button(False)
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
+            self.timeline_label.setText("Прогресс: 0%")
         if self._need_auto_fit:
             self.view.fit_to_rect(self.scene.sceneRect())
             self._need_auto_fit = False
@@ -1325,7 +1876,7 @@ class MainWindow(QMainWindow):
             self.view.centerOn(center)
         total_layers = self.model.get_layer_count()
         file_name = self.current_path.name if self.current_path else "G-code"
-        self.status_label.setText(f"{file_name}: СЃР»РѕР№ {layer + 1} РёР· {max(total_layers, 1)}")
+        self.status_label.setText(f"{file_name}: слой {layer + 1} из {max(total_layers, 1)}")
 
     def _refresh_code_view(self) -> None:
         if self.model is None:
@@ -1347,10 +1898,10 @@ class MainWindow(QMainWindow):
         self.play_pause_button.setEnabled(enabled)
         if not enabled:
             self.timeline_slider.setValue(0)
-            self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
+            self.timeline_label.setText("Прогресс: 0%")
 
     def _update_play_pause_button(self, running: bool) -> None:
-        self.play_pause_button.setText("РџР°СѓР·Р°" if running else "РџСЂРѕРґРѕР»Р¶РёС‚СЊ")
+        self.play_pause_button.setText("Пауза" if running else "Продолжить")
 
     def _on_play_pause_clicked(self) -> None:
         if not self.scene.animation_active:
@@ -1365,7 +1916,7 @@ class MainWindow(QMainWindow):
 
     def _on_animation_progress(self, fraction: float) -> None:
         percent = max(0.0, min(fraction, 1.0)) * 100.0
-        self.timeline_label.setText(f"РџСЂРѕРіСЂРµСЃСЃ: {percent:.1f}%")
+        self.timeline_label.setText(f"Прогресс: {percent:.1f}%")
         if self._block_timeline_updates:
             return
         max_value = max(self.timeline_slider.maximum(), 1)
@@ -1380,7 +1931,7 @@ class MainWindow(QMainWindow):
     def _on_timeline_value_changed(self, value: int) -> None:
         max_value = max(self.timeline_slider.maximum(), 1)
         fraction = value / max_value
-        self.timeline_label.setText(f"РџСЂРѕРіСЂРµСЃСЃ: {fraction * 100:.1f}%")
+        self.timeline_label.setText(f"Прогресс: {fraction * 100:.1f}%")
         if self._block_timeline_updates or not self.animate_button.isChecked():
             return
         self._block_timeline_updates = True
@@ -1418,7 +1969,7 @@ class MainWindow(QMainWindow):
                 self.animate_button.setChecked(False)
             self.scene.set_creation_mode("travel")
             if self.statusBar():
-                self.statusBar().showMessage("Р’С‹Р±РµСЂРёС‚Рµ СЃС‚Р°СЂС‚РѕРІСѓСЋ С‚РѕС‡РєСѓ travel-Р»РёРЅРёРё.", 4000)
+                self.statusBar().showMessage("Выберите стартовую точку travel-линии.", 4000)
         else:
             self.scene.set_creation_mode(None)
             self.scene.clearSelection()
@@ -1439,7 +1990,7 @@ class MainWindow(QMainWindow):
                 self.animate_button.setChecked(False)
                 self._block_animation_toggle = False
                 if self.statusBar():
-                    self.statusBar().showMessage("РќРµС‚ С‚СЂР°РµРєС‚РѕСЂРёР№ РґР»СЏ Р°РЅРёРјР°С†РёРё СЌС‚РѕРіРѕ СЃР»РѕСЏ.", 4000)
+                    self.statusBar().showMessage("Нет траекторий для анимации этого слоя.", 4000)
                 self._set_timeline_controls_enabled(False)
                 self._update_play_pause_button(False)
                 self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
@@ -1447,7 +1998,7 @@ class MainWindow(QMainWindow):
                 self._set_timeline_controls_enabled(True)
                 self._update_play_pause_button(True)
                 self.timeline_slider.setValue(0)
-                self.timeline_label.setText("РџСЂРѕРіСЂРµСЃСЃ: 0%")
+                self.timeline_label.setText("Прогресс: 0%")
         else:
             self.scene.stop_animation()
             self._set_timeline_controls_enabled(False)
@@ -1457,7 +2008,7 @@ class MainWindow(QMainWindow):
     def _on_speed_changed(self, value: int) -> None:
         if self._block_speed_updates:
             return
-        self.speed_label.setText(f"РЎРєРѕСЂРѕСЃС‚СЊ: {value} РјРј/СЃ")
+        self.speed_label.setText(f"Скорость: {value} мм/с")
         self.scene.set_animation_speed(value)
 
     def _on_animation_state_changed(self, running: bool) -> None:
@@ -1479,7 +2030,15 @@ class MainWindow(QMainWindow):
             self._update_play_pause_button(False)
             self.create_travel_button.setEnabled(bool(self.scene.animation_segments))
             if self.statusBar():
-                self.statusBar().showMessage("РђРЅРёРјР°С†РёСЏ РѕСЃС‚Р°РЅРѕРІР»РµРЅР°.", 2000)
+                self.statusBar().showMessage("Анимация остановлена.", 2000)
+
+    def _on_dimensions_toggled(self, checked: bool) -> None:
+        """Toggle dimension display."""
+        self.scene.toggle_dimensions(checked)
+
+    def _on_snap_toggled(self, checked: bool) -> None:
+        """Toggle snap to grid."""
+        self.scene.set_snap_to_grid(checked)
 
 def main() -> None:
     import sys

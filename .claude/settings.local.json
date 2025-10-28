@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m g_code_fixer.gui:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(.venvScriptspython.exe -m pip install PyQt6)",
+      "Bash(\".venv/Scripts/python.exe\" -m pip install PyQt6)",
+      "Bash(\".venv/Scripts/python.exe\" -m g_code_fixer.gui)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

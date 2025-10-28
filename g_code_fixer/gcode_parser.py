@@ -373,3 +373,45 @@ class GCodeModel:
         self.commands.insert(command_index + 1, new_command)
         self.recompute_states()
         return command_index + 1
+
+    def delete_command(self, command_index: int) -> bool:
+        """Delete a command at the given index."""
+        if command_index < 0 or command_index >= len(self.commands):
+            raise IndexError("command_index out of range")
+
+        command = self.commands[command_index]
+        if not command.is_move():
+            raise ValueError("Can only delete move commands")
+
+        del self.commands[command_index]
+        self.recompute_states()
+        return True
+
+    def toggle_extrusion(self, command_index: int) -> bool:
+        """Toggle a move command between extrusion and travel (G1 <-> G0)."""
+        if command_index < 0 or command_index >= len(self.commands):
+            raise IndexError("command_index out of range")
+
+        command = self.commands[command_index]
+        if not command.is_move():
+            raise ValueError("Can only toggle move commands")
+
+        # Toggle between G0/G00 (travel) and G1/G01 (extrusion)
+        if command.command in {"G0", "G00"}:
+            command.command = "G1"
+            # Add E parameter if not present
+            if "E" not in command.params and command.state_before.e is not None:
+                # Simple heuristic: add small extrusion based on distance
+                start = command.state_before
+                end = command.state_after
+                if start.x is not None and start.y is not None and end.x is not None and end.y is not None:
+                    distance = math.hypot(end.x - start.x, end.y - start.y)
+                    command.params["E"] = command.state_before.e + distance * 0.05  # Arbitrary extrusion ratio
+        elif command.command in {"G1", "G01"}:
+            command.command = "G0"
+            # Remove E parameter to make it a travel move
+            if "E" in command.params:
+                del command.params["E"]
+
+        self.recompute_states()
+        return True
